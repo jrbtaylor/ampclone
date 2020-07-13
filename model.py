@@ -14,13 +14,15 @@ class SimpleCNN(nn.Module):
         self.activation = ACTIVATIONS[activation]
         for d in range(depth):
             channels_in = 1 if d == 0 else width
-            channels_out = 1 if d == depth-1 else width
+            channels_out = width
             self.layers.append(nn.ConstantPad1d((filter_length-1, 0), 0.))
             self.layers.append(nn.Conv1d(channels_in, channels_out, kernel_size=filter_length, stride=1))
+        # output gain
+        self.layers.append(nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=False))
 
     def forward(self, x):
-        for layer in self.layers:
+        for layer in self.layers[:-1]:
             x = layer(x)
             x = self.activation(x)
+        x = self.layers[-1](x)
         return x
-
