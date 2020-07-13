@@ -16,6 +16,41 @@ def load_wav(filename):
     return data, rate
 
 
+def find_latency(train_signal='chirp'):
+    from train import BASE_DIR
+    if train_signal == 'chirp':
+        train_signal = BASE_DIR + 'train2.wav'
+        train_label = BASE_DIR + 'train2_2204_212.wav'
+    elif train_signal == 'noise':
+        train_signal = BASE_DIR + 'train.wav'
+        train_label = BASE_DIR + 'train_2204_212.wav'
+    elif train_signal == 'validation':
+        train_signal = BASE_DIR + 'validation.wav'
+        train_label = BASE_DIR + 'validation_2204_212.wav'
+    train_signal, _ = load_wav(train_signal)
+    train_label, _ = load_wav(train_label)
+    train_label = train_label[:train_signal.size]
+
+    # def normalize(x):
+    #     x = x-np.mean(x)
+    #     x = x/np.std(x)
+    #     return x
+    def normalize(x):
+        x = np.sign(x).astype('float')
+        return x
+    train_label = normalize(train_label)
+    train_signal = normalize(train_signal)
+
+    max_shift = int(RATE*3*1e-3)
+    shifts = np.arange(0, max_shift)
+    mses = [np.mean(np.square(train_signal-train_label)) if shift == 0
+            else np.mean(np.square(train_signal[shift:]-train_label[:-shift]))
+            for shift in shifts]
+    print(mses)
+    print(np.mean(np.square(train_label)))
+    print(shifts[np.argmin(mses)])
+
+
 def generate_noise(length, std=0.1):
     return np.random.normal(loc=0., scale=std, size=[length])
 
@@ -63,12 +98,15 @@ def generate_train_signal2(saveto):
 
 
 def split_signal(data):
-    split_length = 96000  # this appears to be the limit for laptop cpu training
+    # split_length = 96000  # this appears to be the limit for laptop cpu training
+    split_length = int(np.ceil(data.size/(data.size//5e5)))
     if data.size % split_length != 0:
         data = np.concatenate([data, np.zeros(split_length-(data.size % split_length), dtype=data.dtype)], axis=0)
     data = np.array(np.split(data, np.ceil(data.size/split_length)))
     data = np.expand_dims(data, axis=1)
     return data
+    # data = np.expand_dims(np.expand_dims(data, axis=0), axis=0)
+    # return data
 
 
 def clear_print(string='', end=''):
