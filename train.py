@@ -132,12 +132,17 @@ def train_model(train_signal='chirp',
     return best_val[1]
 
 
-def hyperparam_search():
+def hyperparam_search(skip_existing=True):
+    results_json = os.path.join(BASE_DIR, 'hyperparams.json')
+    if os.path.isfile(results_json) and skip_existing:
+        with open(results_json, 'r') as f:
+            results = json.load(f)
+    else:
+        results = {}
     widths = [1] + list(range(4, 20, 4))
     depths = range(3, 9, 2)
     filter_lengths = [128, 256, 512, 1024]
     signals = ['chirp', 'noise']
-    results = {}
     n_experiments = len(widths) * len(depths) * len(filter_lengths) * len(signals)
     n_done = 0
     start_time = time.time()
@@ -146,10 +151,14 @@ def hyperparam_search():
             for filter_length in filter_lengths[::-1]:
                 for signal in signals:
                     exp_name = 'model_%s_width%i_depth%i_filterlength%i' % (signal, width, depth, filter_length)
+                    if skip_existing and exp_name in results:
+                        print('already run %s. skipping' % exp_name)
+                        n_experiments -= 1
+                        continue
                     val_loss = train_model(train_signal=signal, exp_name=exp_name, width=width,
                                            depth=depth, filter_length=filter_length)
                     results[exp_name] = val_loss
-                    with open(os.path.join(BASE_DIR, 'hyperparams.json'), 'w') as f:
+                    with open(results_json, 'w') as f:
                         json.dump(results, f)
                     n_done += 1
                     eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
