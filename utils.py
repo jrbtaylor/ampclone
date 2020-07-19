@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.io.wavfile
 
-LEN_CLIP = 5
+LEN_CLIP = 10
 LEN_SILENCE = 0.25
 OUTPUT_LEVELS = 40
 RATE = 22050
@@ -56,7 +56,7 @@ def generate_noise(length, std=0.1):
 
 
 def generate_chirp(length, f_start, f_end, harmonic_ratio):
-    n_harmonics = np.floor(np.log2(RATE/2/max([f_start, f_end])))
+    n_harmonics = int(np.floor(np.log2(RATE/2/max([f_start, f_end]))))
     if max([f_start, f_end])*2**n_harmonics >= RATE/2:
         raise ValueError('Cannot have %i harmonics. Highest frequency is above the Nyquist rate' % n_harmonics)
     t = np.linspace(0, length, int(length*RATE))
@@ -88,11 +88,12 @@ def generate_train_signal2(saveto):
     signal = []
     f_low = 40  # bass low E
     f_high = 80*8  # twelfth fret high E
-    harmonic_ratio = 0.5  # each harmonic is half the magnitude of the prior one
-    chirp = generate_chirp(LEN_CLIP - LEN_SILENCE, f_low, f_high, harmonic_ratio)
-    for i, std in enumerate(np.logspace(-3.5, -0.6, OUTPUT_LEVELS, endpoint=True)):
-        signal.append(np.sqrt(2)*std*chirp)
-        signal.append(np.zeros([int(RATE*LEN_SILENCE)]))
+    for harmonic_ratio in [0.1*i for i in range(10)]:
+        chirp = generate_chirp(LEN_CLIP - LEN_SILENCE, f_low, f_high, harmonic_ratio)
+        for i, std in enumerate(np.logspace(-3.5, -0.6, OUTPUT_LEVELS, endpoint=True)):
+            x = np.sqrt(2)*std*chirp
+            signal.append(x)
+            signal.append(np.zeros([int(RATE*LEN_SILENCE)]))
     signal = np.concatenate(signal)
     save_wav(signal, saveto, RATE)
 
