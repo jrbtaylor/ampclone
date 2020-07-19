@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 
 import numpy as np
@@ -40,19 +41,13 @@ def get_dataloader(input_path, label_path, batchsize=1, shuffle=False):
     return loader
 
 
-def train_model(train_signal='chirp',
-                exp_name='model_chirp',
+def train_model(exp_name='model',
                 batchsize=1, n_epochs=1000, early_stopping=10,
-                width=16, depth=3, filter_length=512,
-                learnrate=1e-4, momentum=0.5, grad_clip=0.5):
-    if train_signal == 'chirp':
-        train_signal = BASE_DIR + 'train2.wav'
-        train_label = BASE_DIR + 'train2_2204_212.wav'
-    elif train_signal == 'noise':
-        train_signal = BASE_DIR + 'train.wav'
-        train_label = BASE_DIR + 'train_2204_212.wav'
-    else:
-        raise ValueError
+                width=16, filter_length=512,
+                learnrate=1e-4, momentum=0.5, grad_clip=0.5,
+                loss_type=None, loss_kwargs=None):
+    train_signal = BASE_DIR + 'train.wav'
+    train_label = BASE_DIR + 'train_2204_212.wav'
     val_signal = BASE_DIR + 'validation.wav'
     val_label = BASE_DIR + 'validation_2204_212.wav'
 
@@ -64,16 +59,16 @@ def train_model(train_signal='chirp',
         os.makedirs(savedir)
     metrics_json = os.path.join(savedir, 'metrics.json')
 
-    net = model.SimpleCNN(width=width, depth=depth, filter_length=filter_length)
+    net = model.WaveNet(width=width, filter_length=filter_length)
     net.to(DEVICE)
 
-    criterion = losses.Loss()
+    criterion = losses.Loss(loss_type, loss_kwargs)
     # optimizer = optim.SGD(net.parameters(), lr=learnrate, momentum=momentum)
-    # optimizer = optim.Adam(net.parameters(), lr=learnrate)
-    optimizer = optim.Adam([
-        {'params': net.layers[-1].parameters(), 'lr': 1e-2 * learnrate},
-        {'params': [param for i in range(len(net.layers) - 1) for param in net.layers[i].parameters()], 'lr': learnrate}
-    ])
+    optimizer = optim.Adam(net.parameters(), lr=learnrate)
+    # optimizer = optim.Adam([
+    #     {'params': net.layers[-1].parameters(), 'lr': 1e-2 * learnrate},
+    #     {'params': [param for i in range(len(net.layers) - 1) for param in net.layers[i].parameters()], 'lr': learnrate}
+    # ])
 
     train_losses = []
     val_losses = []
@@ -126,37 +121,119 @@ def train_model(train_signal='chirp',
             torch.save(net.state_dict(), saveto)
 
             val_outputs = np.concatenate([v.data.cpu().numpy() for v in val_outputs])
-            utils.save_wav(val_outputs, os.path.join(savedir, 'val_output_%i.wav' % epoch))
+            utils.save_wav(val_outputs, os.path.join(savedir, 'val_output.wav'))
         elif epoch - best_val[0] >= early_stopping:
             break
     return best_val[1]
 
 
 def hyperparam_search(skip_existing=True):
-    results_json = os.path.join(BASE_DIR, 'hyperparams.json')
+    """
+    notes from first version:
+    width and filter length don't make a huge difference
+    validation loss for chirp is 50% lower than noise. stop using noise training signal
+    depth makes a huge difference (tradeoff need for more gain stages with vanishing gradients from sigmoids)
+
+    TODO: find a better loss function by training a bunch of networks on different losses and listening
+    TODO: investigate other training signals, including DI files, longer training signals, etc.
+    TODO: try multiplicative interactions between layers, and shortcuts (add or concat)
+    """
+    results_json = os.path.join(BASE_DIR, 'hyperparams_losses.json')
     if os.path.isfile(results_json) and skip_existing:
         with open(results_json, 'r') as f:
             results = json.load(f)
     else:
         results = {}
-    widths = [1] + list(range(4, 20, 4))
-    depths = range(3, 9, 2)
-    filter_lengths = [128, 256, 512, 1024]
-    signals = ['chirp', 'noise']
-    n_experiments = len(widths) * len(depths) * len(filter_lengths) * len(signals)
+    widths = [4]  # [1] + list(range(4, 20, 4))
+    depths = [5]  # range(3, 9, 2)
+    filter_lengths = [1024]  # [128, 256, 512, 1024]
+    signals = ['chirp']  # ['chirp', 'noise']  # validation loss for chirp is ~50% lower
+    n_ffts = [2048, 4096, 4096*2, 4096*4, 4096*8]
+    n_fft_kwargs = [{'n_ffts': n_fft} for n_fft in n_ffts]
+    # loss_types = {'ssim_time': [{}],
+    #               'ssim_mel': n_fft_kwargs,
+    #               'l1_mel': n_fft_kwargs,
+    #               'l2_mel': n_fft_kwargs,
+    #               'l1_fft': n_fft_kwargs,
+    #               'l2_fft': n_fft_kwargs}
+    loss_types = {'ssim_mel': n_fft_kwargs,
+                  'l1_mel': n_fft_kwargs,
+                  'l2_mel': n_fft_kwargs,
+                  'l1_fft': n_fft_kwargs,
+                  'l2_fft': n_fft_kwargs}
+    n_losses = sum([len(v) for v in loss_types.values()])
+    n_experiments = len(widths) * len(depths) * len(filter_lengths) * len(signals) * n_losses
     n_done = 0
     start_time = time.time()
     for width in widths[::-1]:
         for depth in depths[::-1]:
             for filter_length in filter_lengths[::-1]:
                 for signal in signals:
-                    exp_name = 'model_%s_width%i_depth%i_filterlength%i' % (signal, width, depth, filter_length)
+                    for loss_type, loss_kwargs in loss_types.items():
+                        for loss_kwarg in loss_kwargs:
+                            print(loss_kwarg)
+                            exp_name = 'model_%s_width%i_depth%i_filterlength%i_%s_%s' % (
+                                signal, width, depth, filter_length, loss_type, re.sub(r"[ :'{}]", '', str(loss_kwarg)))
+                            if skip_existing and exp_name in results:
+                                print('already run %s. skipping' % exp_name)
+                                n_experiments -= 1
+                                continue
+                            print(exp_name)
+                            val_loss = train_model(train_signal=signal, exp_name=exp_name, width=width,
+                                                   depth=depth, filter_length=filter_length,
+                                                   loss_type=loss_type, loss_kwargs=loss_kwarg)
+                            results[exp_name] = val_loss
+                            with open(results_json, 'w') as f:
+                                json.dump(results, f)
+                            n_done += 1
+                            eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
+                            hours = int(eta // 60)
+                            minutes = int(eta % 60)
+                            print('--------- Completed experiment %i of %i. ETA: %i:%i'
+                                  % (n_done, n_experiments, hours, minutes))
+
+    print('Best result: %.4f validation loss in experiment %s' % (min(results.values()), min(results, key=results.get)))
+
+
+def hyperparam_search_wavenet(skip_existing=True):
+    """
+    TODO: find a better loss function by training a bunch of networks on different losses and listening
+    TODO: investigate other training signals, including DI files, longer training signals, etc.
+    """
+    results_json = os.path.join(BASE_DIR, 'hyperparams_losses.json')
+    if os.path.isfile(results_json) and skip_existing:
+        with open(results_json, 'r') as f:
+            results = json.load(f)
+    else:
+        results = {}
+    widths = [16]
+    filter_lengths = [3, 10, 50, 100]
+    n_ffts = [2048, 4096, 4096*2, 4096*4, 4096*8]
+    n_fft_kwargs = [{'n_ffts': n_fft} for n_fft in n_ffts]
+    loss_types = {'l2': [{}],
+                  'ssim_time': [{}],
+                  'ssim_mel': n_fft_kwargs,
+                  'l1_mel': n_fft_kwargs,
+                  'l2_mel': n_fft_kwargs,
+                  'l1_fft': n_fft_kwargs,
+                  'l2_fft': n_fft_kwargs}
+    n_losses = sum([len(v) for v in loss_types.values()])
+    n_experiments = len(widths) * len(filter_lengths) * n_losses
+    n_done = 0
+    start_time = time.time()
+    for width in widths[::-1]:
+        for filter_length in filter_lengths[::-1]:
+            for loss_type, loss_kwargs in loss_types.items():
+                for loss_kwarg in loss_kwargs:
+                    exp_name = 'model_width%i_filterlength%i_%s_%s' % (
+                        width, filter_length, loss_type, re.sub(r"[ :'{}]", '', str(loss_kwarg)))
                     if skip_existing and exp_name in results:
                         print('already run %s. skipping' % exp_name)
                         n_experiments -= 1
                         continue
-                    val_loss = train_model(train_signal=signal, exp_name=exp_name, width=width,
-                                           depth=depth, filter_length=filter_length)
+                    print(exp_name)
+                    val_loss = train_model(exp_name=exp_name, width=width, filter_length=filter_length,
+                                           loss_type=loss_type, loss_kwargs=loss_kwarg)
                     results[exp_name] = val_loss
                     with open(results_json, 'w') as f:
                         json.dump(results, f)
