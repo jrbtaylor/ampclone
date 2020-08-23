@@ -2,6 +2,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from melfilters import gabor
+
 
 ACTIVATIONS = {'sigmoid': nn.Sigmoid(),
                'tanh': nn.Tanh(),
@@ -69,3 +71,46 @@ class WaveNet(nn.Module):
                 x = x+scaled
         outputs = torch.cat(outputs, dim=1)
         return self.mixer(outputs)
+
+
+class MelFilter(nn.Module):
+    def __init__(self, n_filters, f_min, f_max, fs, filter_length):
+        super(MelFilter, self).__init__()
+        filters = np.array(gabor(n_filters, f_min, f_max, fs, filter_length))
+        # expand dims so filters is shaped (n_filters, in_channels=1, filter_length)
+        filters = np.expand_dims(filters, axis=1)
+        self.filters = torch.nn.Parameter(torch.from_numpy(filters).type(torch.get_default_dtype()),
+                                          requires_grad=False)
+        self.pad = nn.ConstantPad1d((filter_length - 1, 0), 0.)
+
+    def forward(self, x):
+        x = self.pad(x)
+        return torch.nn.functional.conv1d(x, self.filters)
+
+
+class FixedFilters(nn.Module):
+    def __init__(self, width=20, depth=7, filter_length=64, activation='sigmoid',
+                 f_min=40, f_max=10000, fs=22050, bias=True):
+        """
+        Notes:  - bias is significantly better than no bias
+                - filter length 64 is significantly better than 256 (results pending for 32)
+        """
+        super(FixedFilters, self).__init__()
+        self.filters = MelFilter(width, f_min, f_max, fs, filter_length)
+        self.recombines = nn.ModuleList()
+        self.activation = ACTIVATIONS[activation]
+        self.depth = depth
+
+        for d in range(depth):
+            self.recombines.append(torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias))
+        # output gain
+        self.output_gain = nn.Conv1d(1, 1, kernel_size=1, stride=1, bias=False)
+
+    def forward(self, x):
+        for idx in range(self.depth):
+            x = self.filters(x)
+            x = self.recombines[idx](x)
+            x = self.activation(x)
+        x = self.output_gain(x)
+        return x
+
