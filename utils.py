@@ -12,6 +12,12 @@ def save_wav(data, filename, rate=RATE):
 
 
 def load_wav(filename):
+    if isinstance(filename, list):
+        data = []
+        for f in filename:
+            d, rate = load_wav(f)
+            data.append(d)
+        return np.concatenate(data, axis=0), rate
     rate, data = scipy.io.wavfile.read(filename)
     return data, rate
 
@@ -100,7 +106,7 @@ def generate_train_signal2(saveto):
 
 def split_signal(data):
     # split_length = 96000  # this appears to be the limit for laptop cpu training
-    split_length = int(np.ceil(data.size/(data.size//5e5)))
+    split_length = int(np.ceil(data.size/(data.size//1e5)))
     if data.size % split_length != 0:
         data = np.concatenate([data, np.zeros(split_length-(data.size % split_length), dtype=data.dtype)], axis=0)
     data = np.array(np.split(data, np.ceil(data.size/split_length)))
