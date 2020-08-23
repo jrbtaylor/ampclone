@@ -41,15 +41,22 @@ def get_dataloader(input_path, label_path, batchsize=1, shuffle=False):
     return loader
 
 
-def train_model(exp_name='model',
+def train_model(exp_name='model', modeltype='wavenet', model_kwargs=None,
                 batchsize=1, n_epochs=1000, early_stopping=10,
-                width=16, filter_length=512,
                 learnrate=1e-4, momentum=0.5, grad_clip=0.5,
-                loss_type=None, loss_kwargs=None):
-    train_signal = BASE_DIR + 'train.wav'
-    train_label = BASE_DIR + 'train_2204_212.wav'
+                loss_type=None, loss_kwargs=None,
+                train_signal='chirp'):
     val_signal = BASE_DIR + 'validation.wav'
     val_label = BASE_DIR + 'validation_2204_212.wav'
+    if train_signal == 'chirp':
+        train_signal = BASE_DIR + 'train.wav'
+        train_label = BASE_DIR + 'train_2204_212.wav'
+    elif train_signal == 'di':
+        train_signal = BASE_DIR + 'train_alldi.wav'
+        train_label = BASE_DIR + 'train_alldi_2204_212.wav'
+    elif train_signal == 'all':
+        train_signal = [BASE_DIR + 'train_alldi.wav', BASE_DIR + 'train.wav']
+        train_label = [BASE_DIR + 'train_alldi_2204_212.wav', BASE_DIR + 'train_2204_212.wav']
 
     train_loader = get_dataloader(train_signal, train_label, batchsize=batchsize, shuffle=True)
     val_loader = get_dataloader(val_signal, val_label, batchsize=batchsize, shuffle=False)
@@ -59,7 +66,11 @@ def train_model(exp_name='model',
         os.makedirs(savedir)
     metrics_json = os.path.join(savedir, 'metrics.json')
 
-    net = model.WaveNet(width=width, filter_length=filter_length)
+    model_kwargs = {} if model_kwargs is None else model_kwargs
+    if modeltype == 'wavenet':
+        net = model.WaveNet(**model_kwargs)
+    elif modeltype == 'fixedfilters':
+        net = model.FixedFilters(**model_kwargs)
     net.to(DEVICE)
 
     criterion = losses.Loss(loss_type, loss_kwargs)
@@ -102,7 +113,7 @@ def train_model(exp_name='model',
             inputs, labels = data
             outputs = net(inputs)
             loss = criterion(outputs, labels)
-            val_outputs.append(outputs)
+            val_outputs.append(outputs.data.cpu().numpy())
 
             epoch_losses.append(loss.item())
             elapsed = time.time() - start_time
@@ -120,7 +131,7 @@ def train_model(exp_name='model',
             saveto = os.path.join(savedir, exp_name + '.pth')
             torch.save(net.state_dict(), saveto)
 
-            val_outputs = np.concatenate([v.data.cpu().numpy() for v in val_outputs])
+            val_outputs = np.concatenate(val_outputs)
             utils.save_wav(val_outputs, os.path.join(savedir, 'val_output.wav'))
         elif epoch - best_val[0] >= early_stopping:
             break
@@ -206,9 +217,10 @@ def hyperparam_search_wavenet(skip_existing=True):
             results = json.load(f)
     else:
         results = {}
-    widths = [16]
-    filter_lengths = [3, 10, 50, 100]
-    n_ffts = [2048, 4096, 4096*2, 4096*4, 4096*8]
+    train_set = ['di', 'all']
+    widths = [8, 16]
+    filter_lengths = [3, 16]
+    n_ffts = [2048, 4096, 4096*2, 4096*4]
     n_fft_kwargs = [{'n_ffts': n_fft} for n_fft in n_ffts]
     loss_types = {'l2': [{}],
                   'ssim_time': [{}],
@@ -221,27 +233,84 @@ def hyperparam_search_wavenet(skip_existing=True):
     n_experiments = len(widths) * len(filter_lengths) * n_losses
     n_done = 0
     start_time = time.time()
+    for signal in train_set:
+        for width in widths:
+            for filter_length in filter_lengths:
+                for loss_type, loss_kwargs in loss_types.items():
+                    for loss_kwarg in loss_kwargs:
+                        exp_name = 'model_%s_width%i_filterlength%i_%s_%s' % (
+                            signal, width, filter_length, loss_type, re.sub(r"[ :'{}]", '', str(loss_kwarg)))
+                        if skip_existing and exp_name in results:
+                            print('already run %s. skipping' % exp_name)
+                            n_experiments -= 1
+                            continue
+                        print(exp_name)
+                        val_loss = train_model(exp_name=exp_name, width=width, filter_length=filter_length,
+                                               loss_type=loss_type, loss_kwargs=loss_kwarg, train_signal=signal)
+                        results[exp_name] = val_loss
+                        with open(results_json, 'w') as f:
+                            json.dump(results, f)
+                        n_done += 1
+                        eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
+                        hours = int(eta // 60)
+                        minutes = int(eta % 60)
+                        print('--------- Completed experiment %i of %i. ETA: %i:%i'
+                              % (n_done, n_experiments, hours, minutes))
+
+    print('Best result: %.4f validation loss in experiment %s' % (min(results.values()), min(results, key=results.get)))
+
+
+def hyperparam_search_melfilter(skip_existing=True):
+    """
+    try the fixed filter idea, compare with the wavenet results
+    """
+    results_json = os.path.join(BASE_DIR, 'hyperparams_losses_melfilter.json')
+    if os.path.isfile(results_json) and skip_existing:
+        with open(results_json, 'r') as f:
+            results = json.load(f)
+    else:
+        results = {}
+    widths = [10, 20]
+    depths = [5, 7, 9]
+    filter_lengths = [32, 64]  # 64 is better than 256
+    signals = ['di']
+    n_ffts = [8192]
+    n_fft_kwargs = [{'n_ffts': n_fft} for n_fft in n_ffts]
+    loss_types = {'l1_mel': n_fft_kwargs}
+    n_losses = sum([len(v) for v in loss_types.values()])
+    biases = [True]  # definitely need bias
+    n_experiments = len(widths) * len(depths) * len(filter_lengths) * len(signals) * n_losses * len(biases)
+    n_done = 0
+    start_time = time.time()
     for width in widths[::-1]:
-        for filter_length in filter_lengths[::-1]:
-            for loss_type, loss_kwargs in loss_types.items():
-                for loss_kwarg in loss_kwargs:
-                    exp_name = 'model_width%i_filterlength%i_%s_%s' % (
-                        width, filter_length, loss_type, re.sub(r"[ :'{}]", '', str(loss_kwarg)))
-                    if skip_existing and exp_name in results:
-                        print('already run %s. skipping' % exp_name)
-                        n_experiments -= 1
-                        continue
-                    print(exp_name)
-                    val_loss = train_model(exp_name=exp_name, width=width, filter_length=filter_length,
-                                           loss_type=loss_type, loss_kwargs=loss_kwarg)
-                    results[exp_name] = val_loss
-                    with open(results_json, 'w') as f:
-                        json.dump(results, f)
-                    n_done += 1
-                    eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
-                    hours = int(eta // 60)
-                    minutes = int(eta % 60)
-                    print('--------- Completed experiment %i of %i. ETA: %i:%i'
-                          % (n_done, n_experiments, hours, minutes))
+        for depth in depths[::-1]:
+            for filter_length in filter_lengths[::-1]:
+                for signal in signals:
+                    for loss_type, loss_kwargs in loss_types.items():
+                        for loss_kwarg in loss_kwargs:
+                            for bias in biases:
+                                print(loss_kwarg)
+                                exp_name = 'melfilter_bias%s_%s_width%i_depth%i_filterlength%i_%s_%s' % (
+                                    str(bias), signal, width, depth, filter_length, loss_type,
+                                    re.sub(r"[ :'{}]", '', str(loss_kwarg)))
+                                if skip_existing and exp_name in results:
+                                    print('already run %s. skipping' % exp_name)
+                                    n_experiments -= 1
+                                    continue
+                                print(exp_name)
+                                model_kwargs = {'width': width, 'depth': depth, 'filter_length': filter_length,
+                                                'bias': bias}
+                                val_loss = train_model(exp_name=exp_name, modeltype='fixedfilters',
+                                                       model_kwargs=model_kwargs, loss_type=loss_type,
+                                                       loss_kwargs=loss_kwarg, train_signal=signal)
+                                results[exp_name] = val_loss
+                                with open(results_json, 'w') as f:
+                                    json.dump(results, f)
+                                n_done += 1
+                                eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
+                                hours = int(eta // 60)
+                                minutes = int(eta % 60)
+                                print('--------- Completed experiment %i of %i. ETA: %i:%i'
+                                      % (n_done, n_experiments, hours, minutes))
 
     print('Best result: %.4f validation loss in experiment %s' % (min(results.values()), min(results, key=results.get)))
