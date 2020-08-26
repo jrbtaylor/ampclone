@@ -89,11 +89,11 @@ class MelFilter(nn.Module):
 
 
 class FixedFilters(nn.Module):
-    def __init__(self, width=20, depth=7, filter_length=64, activation='sigmoid',
+    def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
                  f_min=40, f_max=10000, fs=22050, bias=True):
         """
         Notes:  - bias is significantly better than no bias
-                - filter length 64 is significantly better than 256 (results pending for 32)
+                - filter lengths 64 and 128 are noticeably better than 256 or 32 (at 22.1 kHz fs)
         """
         super(FixedFilters, self).__init__()
         self.filters = MelFilter(width, f_min, f_max, fs, filter_length)
@@ -102,7 +102,11 @@ class FixedFilters(nn.Module):
         self.depth = depth
 
         for d in range(depth):
-            self.recombines.append(torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias))
+            conv_layer = torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias)
+            conv_layer.weight.data.fill_(1.)
+            if bias:
+                conv_layer.bias.data.fill_(0.)
+            self.recombines.append(conv_layer)
         # output gain
         self.output_gain = nn.Conv1d(1, 1, kernel_size=1, stride=1, bias=False)
 
