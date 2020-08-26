@@ -43,7 +43,7 @@ def get_dataloader(input_path, label_path, batchsize=1, shuffle=False):
 
 def train_model(exp_name='model', modeltype='wavenet', model_kwargs=None,
                 batchsize=1, n_epochs=1000, early_stopping=10,
-                learnrate=1e-4, momentum=0.5, grad_clip=0.5,
+                learnrate=1e-2, momentum=0.5, grad_clip=5.,
                 loss_type=None, loss_kwargs=None,
                 train_signal='chirp'):
     val_signal = BASE_DIR + 'validation.wav'
@@ -85,6 +85,9 @@ def train_model(exp_name='model', modeltype='wavenet', model_kwargs=None,
     val_losses = []
     best_val = [0, np.inf]
     for epoch in range(n_epochs):
+
+        # print([(layer.weight.data.cpu().numpy(), layer.bias.data.cpu().numpy()) for layer in net.recombines])
+
         epoch_losses = []
         start_time = time.time()
         for i, data in enumerate(train_loader):
@@ -101,7 +104,7 @@ def train_model(exp_name='model', modeltype='wavenet', model_kwargs=None,
             utils.clear_print('training step %i    loss = %.4f    elapsed = %.2f minutes    ETA = %.2f minutes'
                               % (i, loss.item(), elapsed / 60, (len(train_loader) - i - 1) * elapsed / (i + 1) / 60))
             if not np.isfinite(loss.item()):
-                print('NaN loss. Closing experiment.')
+                utils.clear_print('NaN loss. Closing experiment.')
                 return best_val[1]
         utils.clear_print('Epoch %i: training loss = %.4f' % (epoch, np.mean(epoch_losses)), end='\n')
         train_losses.append(np.mean(epoch_losses))
@@ -270,15 +273,15 @@ def hyperparam_search_melfilter(skip_existing=True):
             results = json.load(f)
     else:
         results = {}
-    widths = [10, 20]
+    widths = [10, 20, 30]
     depths = [5, 7, 9]
-    filter_lengths = [32, 64]  # 64 is better than 256
+    filter_lengths = [64, 128]  # 64 is better than 256
     signals = ['di']
     n_ffts = [8192]
     n_fft_kwargs = [{'n_ffts': n_fft} for n_fft in n_ffts]
     loss_types = {'l1_mel': n_fft_kwargs}
     n_losses = sum([len(v) for v in loss_types.values()])
-    biases = [True]  # definitely need bias
+    biases = [True]  # definitely needs bias
     n_experiments = len(widths) * len(depths) * len(filter_lengths) * len(signals) * n_losses * len(biases)
     n_done = 0
     start_time = time.time()
@@ -290,7 +293,7 @@ def hyperparam_search_melfilter(skip_existing=True):
                         for loss_kwarg in loss_kwargs:
                             for bias in biases:
                                 print(loss_kwarg)
-                                exp_name = 'melfilter_bias%s_%s_width%i_depth%i_filterlength%i_%s_%s' % (
+                                exp_name = 'melfilter_tanh_bias%s_%s_width%i_depth%i_filterlength%i_%s_%s' % (
                                     str(bias), signal, width, depth, filter_length, loss_type,
                                     re.sub(r"[ :'{}]", '', str(loss_kwarg)))
                                 if skip_existing and exp_name in results:
@@ -300,9 +303,18 @@ def hyperparam_search_melfilter(skip_existing=True):
                                 print(exp_name)
                                 model_kwargs = {'width': width, 'depth': depth, 'filter_length': filter_length,
                                                 'bias': bias}
-                                val_loss = train_model(exp_name=exp_name, modeltype='fixedfilters',
-                                                       model_kwargs=model_kwargs, loss_type=loss_type,
-                                                       loss_kwargs=loss_kwarg, train_signal=signal)
+                                failed_experiments = 0
+                                lr = 1e-2
+                                while failed_experiments < 5:
+                                    val_loss = train_model(exp_name=exp_name, modeltype='fixedfilters',
+                                                           model_kwargs=model_kwargs, loss_type=loss_type,
+                                                           loss_kwargs=loss_kwarg, train_signal=signal, learnrate=lr)
+                                    if np.isfinite(val_loss):
+                                        break
+                                    else:
+                                        print('NaN/Inf loss. Re-running with lower learning rate')
+                                        failed_experiments += 1
+                                        lr = lr/10.
                                 results[exp_name] = val_loss
                                 with open(results_json, 'w') as f:
                                     json.dump(results, f)
@@ -313,4 +325,6 @@ def hyperparam_search_melfilter(skip_existing=True):
                                 print('--------- Completed experiment %i of %i. ETA: %i:%i'
                                       % (n_done, n_experiments, hours, minutes))
 
+    # exclude other metrics for now
+    results = {k: v for k, v in results.items() if 'l1_mel_n_ffts8192' in k}
     print('Best result: %.4f validation loss in experiment %s' % (min(results.values()), min(results, key=results.get)))
