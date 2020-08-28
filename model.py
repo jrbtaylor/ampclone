@@ -11,6 +11,14 @@ ACTIVATIONS = {'sigmoid': nn.Sigmoid(),
                'relu': nn.ReLU()}
 
 
+def get_model(model_type, model_kwargs):
+    models = {'simple': SimpleCNN,
+              'wavnet': WaveNet,
+              'melfilter': FixedFilters,
+              'crossover': Crossover}
+    return models[model_type](**model_kwargs)
+
+
 class SimpleCNN(nn.Module):
     def __init__(self, width=16, depth=3, filter_length=512, activation='sigmoid'):
         super(SimpleCNN, self).__init__()
@@ -93,7 +101,7 @@ class FixedFilters(nn.Module):
                  f_min=40, f_max=10000, fs=22050, bias=True):
         """
         Notes:  - bias is significantly better than no bias
-                - filter lengths 64 and 128 are noticeably better than 256 or 32 (at 22.1 kHz fs)
+                - filter lengths 64 and 128 is noticeably better than 128, 256 or 32 (at 22.1 kHz fs)
         """
         super(FixedFilters, self).__init__()
         self.filters = MelFilter(width, f_min, f_max, fs, filter_length)
@@ -118,3 +126,53 @@ class FixedFilters(nn.Module):
         x = self.output_gain(x)
         return x
 
+
+class Crossover(nn.Module):
+    def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
+                 f_min=40, f_max=10000, fs=22050, bias=True):
+        super(Crossover, self).__init__()
+        self.filters = MelFilter(width, f_min, f_max, fs, filter_length)
+        self.recombines = nn.ModuleList()
+        self.eqs = nn.ModuleList()
+        self.activation = ACTIVATIONS[activation]
+        self.biases = []
+        self.gains = []
+        self.depth = depth
+
+        for d in range(depth):
+            self.biases.append(nn.Parameter(torch.tensor([0.], requires_grad=True)))
+            self.gains.append(nn.Parameter(torch.tensor([1.], requires_grad=True)))
+
+            conv_layer = torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias)
+            conv_layer.weight.data.fill_(1.)
+            if bias:
+                conv_layer.bias.data.fill_(0.)
+            self.recombines.append(conv_layer)
+
+            conv_layer = torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias)
+            conv_layer.weight.data.fill_(1.)
+            if bias:
+                conv_layer.bias.data.fill_(0.)
+            self.eqs.append(conv_layer)
+        # output gain
+        self.output_gain = nn.Conv1d(1, 1, kernel_size=1, stride=1, bias=False)
+
+    def forward(self, x):
+        for idx in range(self.depth):
+            x_pos = nn.ReLU()(x)
+            x_neg = nn.ReLU()(-x)
+            x_pos = self.filters(x_pos)
+            x_neg = self.filters(x_neg)
+            x_pos = self.recombines[idx](x_pos)
+            x_neg = self.recombines[idx](x_neg)
+            x_pos = nn.Sigmoid()(x_pos)
+            x_neg = nn.Sigmoid()(x_neg)
+            x_pos = x_pos+self.biases[idx]
+            x_neg = x_neg+self.biases[idx]
+
+            x = x_pos-x_neg
+            x = self.filters(x)
+            x = self.eqs[idx](x)
+            x = self.activation(x)
+        x = self.output_gain(x)
+        return x
