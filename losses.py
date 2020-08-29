@@ -71,16 +71,26 @@ def get_mse_time_loss():
     return torch.nn.MSELoss(reduction='mean')
 
 
+def get_blend_loss(n_ffts, time_weight):
+    l2_mel_loss = get_l2_mel_loss(n_ffts)
+    mse_loss = get_mse_time_loss()
+
+    def _blend(pred, label):
+        return l2_mel_loss(pred, label)+time_weight*mse_loss(pred, label)
+    return _blend
+
+
 class Loss(nn.Module):
     def __init__(self, loss_type, loss_kwargs):
         super(Loss, self).__init__()
-        loss_dict = {'l2': get_mse_time_loss,
+        loss_dict = {'l2_time': get_mse_time_loss,
                      'ssim_time': get_ssim_time_loss,
                      'ssim_mel': get_ssim_mel_loss,
                      'l1_mel': get_l1_mel_loss,
                      'l2_mel': get_l2_mel_loss,
                      'l1_fft': get_l1_fft_loss,
-                     'l2_fft': get_l2_fft_loss}
+                     'l2_fft': get_l2_fft_loss,
+                     'l1_mel_l2_time': get_blend_loss}
         self.loss_fn = loss_dict[loss_type](**loss_kwargs)
 
     def forward(self, pred, label):
