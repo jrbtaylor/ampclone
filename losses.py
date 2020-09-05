@@ -90,42 +90,8 @@ class Loss(nn.Module):
                      'l2_mel': get_l2_mel_loss,
                      'l1_fft': get_l1_fft_loss,
                      'l2_fft': get_l2_fft_loss,
-                     'l1_mel_l2_time': get_blend_loss}
+                     'blend': get_blend_loss}
         self.loss_fn = loss_dict[loss_type](**loss_kwargs)
 
     def forward(self, pred, label):
         return self.loss_fn(pred, label)
-
-
-# class Loss(nn.Module):
-#     def __init__(self, mse_weight=0.1, std_weight=0.1, fft_weight=0.1, ssim_weight=1.):
-#         """
-#         MSE (may need to correct for latency later)
-#         Difference in std
-#         Spectral difference
-#         """
-#         super(Loss, self).__init__()
-#         self.mse_weight = mse_weight
-#         self.std_weight = std_weight
-#         self.fft_weight = fft_weight
-#         self.ssim_weight = ssim_weight
-#
-#     def forward(self, pred, label):
-#         """
-#         :param pred: model output (batch, 1, length)
-#         :param label: groundtruth (batch, 1, length)
-#         :return:
-#         """
-#         mse_loss = nn.MSELoss(reduction='mean')(pred, label)
-#
-#         std_loss = torch.square(torch.std_mean(pred)[0] - torch.std_mean(label)[0])
-#
-#
-#         fft_loss = get_fft_loss(pred, label)
-#
-#         ssim_loss = get_ssim_loss(pred, label)
-#
-#         total_loss = self.mse_weight * mse_loss + self.std_weight * std_loss + self.fft_weight * fft_loss \
-#                      + self.ssim_weight * ssim_loss
-#
-#         return total_loss
