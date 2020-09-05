@@ -1,8 +1,11 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torchaudio
 
 from melfilters import gabor
+from filterbank import filterbank
+from iir_ops import m_lfilter
 
 
 ACTIVATIONS = {'sigmoid': nn.Sigmoid(),
@@ -14,8 +17,9 @@ ACTIVATIONS = {'sigmoid': nn.Sigmoid(),
 def get_model(model_type, model_kwargs):
     models = {'simple': SimpleCNN,
               'wavnet': WaveNet,
-              'melfilter': FixedFilters,
-              'crossover': Crossover}
+              'fixedfilter': FixedFilters,
+              'crossover': Crossover,
+              'blender': Blender}
     return models[model_type](**model_kwargs)
 
 
@@ -96,21 +100,59 @@ class MelFilter(nn.Module):
         return torch.nn.functional.conv1d(x, self.filters)
 
 
+class IIRFilter(nn.Module):
+    def __init__(self, n_filters=30, f_min=40, f_max=16000, fs=44100, filter_length=7):
+        super(IIRFilter, self).__init__()
+        assert filter_length % 2 == 1
+        filter_order = (filter_length-1)//2
+        filters = filterbank(n_filters, f_min, f_max, fs, filter_order)
+        # self.filter_bs = torch.nn.ParameterList(
+        #     [torch.nn.Parameter(torch.from_numpy(f[0]).type(torch.get_default_dtype()), requires_grad=False)
+        #      for f in filters])
+        # self.filter_as = torch.nn.ParameterList(
+        #     [torch.nn.Parameter(torch.from_numpy(f[1]).type(torch.get_default_dtype()),requires_grad=False)
+        #      for f in filters])
+        self.filter_bs = nn.Parameter(
+            torch.stack([torch.from_numpy(f[0]).type(torch.get_default_dtype()) for f in filters]), requires_grad=False)
+        self.filter_as = nn.Parameter(
+            torch.stack([torch.from_numpy(f[1]).type(torch.get_default_dtype()) for f in filters]), requires_grad=False)
+
+        # note: padding is automatic in torchaudio.functional.lfilter
+        # self.pad = nn.ConstantPad1d((filter_length - 1, 0), 0.)
+
+    def forward(self, x):
+        # x = self.pad(x)
+        # y = []
+        # for b, a in zip(self.filter_bs, self.filter_as):
+        #     y.append(torchaudio.functional.lfilter(x, a, b))  # , clamp=False)
+        # return torch.cat(y, 1)
+        y = m_lfilter(x, self.filter_as, self.filter_bs)
+        return y
+
+
 class FixedFilters(nn.Module):
     def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
-                 f_min=40, f_max=10000, fs=22050, bias=True):
+                 f_min=40, f_max=10000, fs=44100, bias=True, filter_type='mel'):
         """
         Notes:  - bias is significantly better than no bias
                 - filter lengths 64 and 128 is noticeably better than 128, 256 or 32 (at 22.1 kHz fs)
         """
         super(FixedFilters, self).__init__()
-        self.filters = MelFilter(width, f_min, f_max, fs, filter_length)
+        self.filter_type = filter_type
+        if filter_type == 'mel':
+            self.filters = MelFilter(width, f_min, f_max, fs, filter_length)
+        else:  # IIR filter
+            self.filters = nn.ModuleList([IIRFilter(width // 2, f_min, f_max, fs, filter_length),
+                                          IIRFilter(width, f_min, f_max, fs, filter_length)])
         self.recombines = nn.ModuleList()
         self.activation = ACTIVATIONS[activation]
         self.depth = depth
 
         for d in range(depth):
-            conv_layer = torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias)
+            if self.filter_type == 'mel':
+                conv_layer = torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias)
+            else:
+                conv_layer = torch.nn.Conv1d(width // 2 if d % 2 == 0 else width, 1, kernel_size=1, stride=1, bias=bias)
             conv_layer.weight.data.fill_(1.)
             if bias:
                 conv_layer.bias.data.fill_(0.)
@@ -120,16 +162,67 @@ class FixedFilters(nn.Module):
 
     def forward(self, x):
         for idx in range(self.depth):
-            x = self.filters(x)
+            if self.filter_type == 'mel':
+                x = self.filters(x)
+            else:
+                x = self.filters[idx % len(self.filters)](x)
             x = self.recombines[idx](x)
             x = self.activation(x)
         x = self.output_gain(x)
         return x
 
 
+class Blender(nn.Module):
+    def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
+                 f_min=40, f_max=20000, fs=44100, bias=True, filter_type='mel'):
+        """
+        Similar to FixedFilters model but each layer has a learned "blend" parameter that blends its input and output
+        """
+        super(Blender, self).__init__()
+        self.filter_type = filter_type
+        if filter_type == 'mel':
+            self.filters = MelFilter(width, f_min, f_max, fs, filter_length)
+        else:  # IIR filter
+            self.filters = nn.ModuleList([IIRFilter(width // 2, f_min, f_max, fs, filter_length),
+                                          IIRFilter(width, f_min, f_max, fs, filter_length)])
+        self.recombines = nn.ModuleList()
+        self.activation = ACTIVATIONS[activation]
+        self.depth = depth
+        self.blends = torch.nn.ParameterList()
+        self.blend_sigmoid = torch.nn.Sigmoid()
+
+        for d in range(depth):
+            if self.filter_type == 'mel':
+                conv_layer = torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias)
+            else:
+                conv_layer = torch.nn.Conv1d(width // 2 if d % 2 == 0 else width, 1, kernel_size=1, stride=1, bias=bias)
+            conv_layer.weight.data.fill_(1.)
+            if bias:
+                conv_layer.bias.data.fill_(0.)
+            self.recombines.append(conv_layer)
+            self.blends.append(
+                torch.nn.Parameter(torch.from_numpy(np.array(1.)).type(torch.get_default_dtype()),
+                                   requires_grad=True))
+        # output gain
+        self.output_gain = nn.Conv1d(1, 1, kernel_size=1, stride=1, bias=False)
+
+    def forward(self, x):
+        for idx in range(self.depth):
+            if self.filter_type == 'mel':
+                y = self.filters(x)
+            else:
+                y = self.filters[idx % len(self.filters)](x)
+            y = self.recombines[idx](y)
+            y = self.activation(y)
+            blend = self.blend_sigmoid(self.blends[idx])
+            x = (1-blend)*x+blend*y
+        x = self.output_gain(x)
+        return x
+
+
 class Crossover(nn.Module):
     def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
-                 f_min=40, f_max=10000, fs=22050, bias=True):
+                 f_min=40, f_max=10000, fs=44100, bias=True):
         super(Crossover, self).__init__()
         self.filters = MelFilter(width, f_min, f_max, fs, filter_length)
         self.recombines = nn.ModuleList()
