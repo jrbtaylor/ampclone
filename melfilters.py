@@ -11,7 +11,7 @@ from __future__ import division
 import numpy as np
 
 
-def gabor(nfilters, f_min=40, f_max=10000, fs=22050, wlen=25, nfft=2048):
+def gabor(nfilters, f_min=40, f_max=10000, fs=44100, wlen=25, nfft=2048):
     if nfilters % 2 != 0:
         print('Warning: nfilters should be a multiple of 2 for splitting real and imaginary components. Adding 1.')
     gabor_object = Gabor(nfilters//2, f_min, f_max, fs, wlen, nfft=nfft)  # , normalize_energy=True)
