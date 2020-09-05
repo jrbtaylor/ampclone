@@ -4,7 +4,7 @@ import torch.nn as nn
 import torchaudio
 
 from melfilters import gabor
-from filterbank import filterbank
+from filterbank import filterbank_iir
 from iir_ops import m_lfilter
 
 
@@ -19,7 +19,8 @@ def get_model(model_type, model_kwargs):
               'wavnet': WaveNet,
               'fixedfilter': FixedFilters,
               'crossover': Crossover,
-              'blender': Blender}
+              'blender': Blender,
+              'prefiltered': Prefiltered}
     return models[model_type](**model_kwargs)
 
 
@@ -105,7 +106,7 @@ class IIRFilter(nn.Module):
         super(IIRFilter, self).__init__()
         assert filter_length % 2 == 1
         filter_order = (filter_length-1)//2
-        filters = filterbank(n_filters, f_min, f_max, fs, filter_order)
+        filters = filterbank_iir(n_filters, f_min, f_max, fs, filter_order)
         # self.filter_bs = torch.nn.ParameterList(
         #     [torch.nn.Parameter(torch.from_numpy(f[0]).type(torch.get_default_dtype()), requires_grad=False)
         #      for f in filters])
@@ -216,6 +217,37 @@ class Blender(nn.Module):
             y = self.activation(y)
             blend = self.blend_sigmoid(self.blends[idx])
             x = (1-blend)*x+blend*y
+        x = self.output_gain(x)
+        return x
+
+
+class Prefiltered(nn.Module):
+    def __init__(self, width=40, depth=5):
+        super(Prefiltered, self).__init__()
+        self.depth = depth
+        self.gains = nn.ParameterList()
+        self.biases = nn.ParameterList()
+        self.recombines = torch.nn.ModuleList([torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=True)])
+        self.recombines[0].weight.data.fill_(1./width)
+        self.recombines[0].bias.data.fill_(0.)
+        self.activation = nn.Tanh()
+        self.output_gain = nn.Conv1d(1, 1, kernel_size=1, stride=1, bias=False)
+
+        for d in range(depth):
+            self.gains.append(
+                nn.Parameter(torch.from_numpy(np.ones([1, width, 1])).type(torch.get_default_dtype()),
+                             requires_grad=True))
+            self.biases.append(
+                nn.Parameter(torch.from_numpy(np.zeros([1, width, 1])).type(torch.get_default_dtype()),
+                             requires_grad=True))
+
+    def forward(self, x):
+        for idx in range(self.depth):
+            x = torch.mul(x, self.gains[idx])
+            x = torch.add(x, self.biases[idx])
+            x = self.activation(x)
+        x = self.recombines[0](x)
+        x = self.activation(x)
         x = self.output_gain(x)
         return x
 
