@@ -14,6 +14,7 @@ import losses
 import utils
 
 BASE_DIR = '/home/jtaylor/cloner/'  # 'C:/Users/Jason/Documents/cloner/'
+FS = 44100
 
 if torch.cuda.is_available():
     DEVICE = torch.device('cuda:0')
@@ -41,27 +42,22 @@ def get_dataloader(input_path, label_path, batchsize=1, shuffle=False):
     return loader
 
 
-def train_model(exp_name='model', modeltype='wavenet', model_kwargs=None,
-                batchsize=1, n_epochs=1000, early_stopping=30,
-                learnrate=1e-2, momentum=0.9, grad_clip=5.,
-                loss_type=None, loss_kwargs=None,
-                train_signal='chirp'):
-    val_signal = BASE_DIR + 'validation.wav'
-    val_label = BASE_DIR + 'validation_2204_212.wav'
-    if train_signal == 'chirp':
-        train_signal = BASE_DIR + 'train.wav'
-        train_label = BASE_DIR + 'train_2204_212.wav'
-    elif train_signal == 'di':
-        train_signal = BASE_DIR + 'train_alldi.wav'
-        train_label = BASE_DIR + 'train_alldi_2204_212.wav'
-    elif train_signal == 'all':
-        train_signal = [BASE_DIR + 'train_alldi.wav', BASE_DIR + 'train.wav']
-        train_label = [BASE_DIR + 'train_alldi_2204_212.wav', BASE_DIR + 'train_2204_212.wav']
+def train_model(exp_name='model', amp='jcm800', modeltype='fixedfilter', model_kwargs=None,
+                batchsize=1, n_epochs=1000, early_stopping=30, learnrate=1e-2, grad_clip=5.,
+                loss_type=None, loss_kwargs=None):
+    if amp not in exp_name:
+        exp_name = amp+'_'+exp_name
+
+    data_dir = os.path.join(BASE_DIR, 'data_%i' % FS)
+    train_signal = os.path.join(data_dir, 'train_di.wav')
+    train_label = os.path.join(data_dir, 'train_di_'+amp+'.wav')
+    val_signal = os.path.join(data_dir, 'validation.wav')
+    val_label = os.path.join(data_dir, 'validation_'+amp+'.wav')
 
     train_loader = get_dataloader(train_signal, train_label, batchsize=batchsize, shuffle=True)
     val_loader = get_dataloader(val_signal, val_label, batchsize=batchsize, shuffle=False)
 
-    savedir = os.path.join(BASE_DIR, 'models', exp_name)
+    savedir = os.path.join(BASE_DIR, 'models_%i' % FS, exp_name)
     if not os.path.isdir(savedir):
         os.makedirs(savedir)
     metrics_json = os.path.join(savedir, 'metrics.json')
@@ -71,20 +67,28 @@ def train_model(exp_name='model', modeltype='wavenet', model_kwargs=None,
     net.to(DEVICE)
 
     criterion = losses.Loss(loss_type, loss_kwargs)
-    # optimizer = optim.SGD(net.parameters(), lr=learnrate, momentum=momentum)
     optimizer = optim.Adam(net.parameters(), lr=learnrate)
+    # TODO: debug filtering lists of parameters to train some with lower learning rates
+    # if hasattr(net, 'slow_parameters'):
+    #     regular_parameters = [param for param in net.parameters() if param not in net.slow_parameters]
+    #     optimizer = optim.Adam([
+    #         {'params': net.slow_parameters, 'lr': 1e-2 * learnrate},
+    #         {'params': regular_parameters, 'lr': learnrate}
+    #     ])
+    # else:
+    #     optimizer = optim.Adam(net.parameters(), lr=learnrate)
+
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, 0.95)
-    # optimizer = optim.Adam([
-    #     {'params': net.layers[-1].parameters(), 'lr': 1e-2 * learnrate},
-    #     {'params': [param for i in range(len(net.layers) - 1) for param in net.layers[i].parameters()], 'lr': learnrate}
-    # ])
 
     train_losses = []
     val_losses = []
     best_val = [0, np.inf]
     for epoch in range(n_epochs):
 
-        # print([(layer.weight.data.cpu().numpy(), layer.bias.data.cpu().numpy()) for layer in net.recombines])
+        print([(np.min(layer.weight.data.cpu().numpy()), np.max(layer.weight.data.cpu().numpy()))
+               for layer in net.recombines])
+        if hasattr(net, 'blends'):
+            print(np.stack([b.data.cpu().numpy() for b in net.blends]))
 
         epoch_losses = []
         start_time = time.time()
@@ -101,8 +105,12 @@ def train_model(exp_name='model', modeltype='wavenet', model_kwargs=None,
             elapsed = time.time() - start_time
             utils.clear_print('training step %i    loss = %.4f    elapsed = %.2f minutes    ETA = %.2f minutes'
                               % (i, loss.item(), elapsed / 60, (len(train_loader) - i - 1) * elapsed / (i + 1) / 60))
+            print('\n'+str([(np.min(layer.weight.data.cpu().numpy()), np.max(layer.weight.data.cpu().numpy()))
+                            for layer in net.recombines]))
             if not np.isfinite(loss.item()):
                 utils.clear_print('NaN loss. Closing experiment.')
+                if epoch < early_stopping:
+                    return np.inf
                 return best_val[1]
         utils.clear_print('Epoch %i: training loss = %.4f' % (epoch, np.mean(epoch_losses)), end='\n')
         train_losses.append(np.mean(epoch_losses))
@@ -142,261 +150,137 @@ def train_model(exp_name='model', modeltype='wavenet', model_kwargs=None,
 
 
 def hyperparam_search(skip_existing=True):
-    """
-    notes from first version:
-    width and filter length don't make a huge difference
-    validation loss for chirp is 50% lower than noise. stop using noise training signal
-    depth makes a huge difference (tradeoff need for more gain stages with vanishing gradients from sigmoids)
-
-    TODO: find a better loss function by training a bunch of networks on different losses and listening
-    TODO: investigate other training signals, including DI files, longer training signals, etc.
-    TODO: try multiplicative interactions between layers, and shortcuts (add or concat)
-    """
-    results_json = os.path.join(BASE_DIR, 'hyperparams_losses.json')
+    results_json = os.path.join(BASE_DIR, 'results_44100.json')
     if os.path.isfile(results_json) and skip_existing:
         with open(results_json, 'r') as f:
             results = json.load(f)
     else:
         results = {}
-    widths = [4]  # [1] + list(range(4, 20, 4))
-    depths = [5]  # range(3, 9, 2)
-    filter_lengths = [1024]  # [128, 256, 512, 1024]
-    signals = ['chirp']  # ['chirp', 'noise']  # validation loss for chirp is ~50% lower
-    n_ffts = [2048, 4096, 4096*2, 4096*4, 4096*8]
-    n_fft_kwargs = [{'n_ffts': n_fft} for n_fft in n_ffts]
-    # loss_types = {'ssim_time': [{}],
-    #               'ssim_mel': n_fft_kwargs,
-    #               'l1_mel': n_fft_kwargs,
-    #               'l2_mel': n_fft_kwargs,
-    #               'l1_fft': n_fft_kwargs,
-    #               'l2_fft': n_fft_kwargs}
-    loss_types = {'ssim_mel': n_fft_kwargs,
-                  'l1_mel': n_fft_kwargs,
-                  'l2_mel': n_fft_kwargs,
-                  'l1_fft': n_fft_kwargs,
-                  'l2_fft': n_fft_kwargs}
-    n_losses = sum([len(v) for v in loss_types.values()])
-    n_experiments = len(widths) * len(depths) * len(filter_lengths) * len(signals) * n_losses
-    n_done = 0
-    start_time = time.time()
-    for width in widths[::-1]:
-        for depth in depths[::-1]:
-            for filter_length in filter_lengths[::-1]:
-                for signal in signals:
-                    for loss_type, loss_kwargs in loss_types.items():
-                        for loss_kwarg in loss_kwargs:
-                            print(loss_kwarg)
-                            exp_name = 'model_%s_width%i_depth%i_filterlength%i_%s_%s' % (
-                                signal, width, depth, filter_length, loss_type, re.sub(r"[ :'{}]", '', str(loss_kwarg)))
-                            if skip_existing and exp_name in results:
-                                print('already run %s. skipping' % exp_name)
-                                n_experiments -= 1
-                                continue
-                            print(exp_name)
-                            val_loss = train_model(train_signal=signal, exp_name=exp_name, width=width,
-                                                   depth=depth, filter_length=filter_length,
-                                                   loss_type=loss_type, loss_kwargs=loss_kwarg)
-                            results[exp_name] = val_loss
-                            with open(results_json, 'w') as f:
-                                json.dump(results, f)
-                            n_done += 1
-                            eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
-                            hours = int(eta // 60)
-                            minutes = int(eta % 60)
-                            print('--------- Completed experiment %i of %i. ETA: %i:%i'
-                                  % (n_done, n_experiments, hours, minutes))
-
-    print('Best result: %.4f validation loss in experiment %s' % (min(results.values()), min(results, key=results.get)))
-
-
-def hyperparam_search_wavenet(skip_existing=True):
-    """
-    TODO: find a better loss function by training a bunch of networks on different losses and listening
-    TODO: investigate other training signals, including DI files, longer training signals, etc.
-    """
-    results_json = os.path.join(BASE_DIR, 'hyperparams_losses.json')
-    if os.path.isfile(results_json) and skip_existing:
-        with open(results_json, 'r') as f:
-            results = json.load(f)
-    else:
-        results = {}
-    train_set = ['di', 'all']
-    widths = [8, 16]
-    filter_lengths = [3, 16]
-    n_ffts = [2048, 4096, 4096*2, 4096*4]
-    n_fft_kwargs = [{'n_ffts': n_fft} for n_fft in n_ffts]
-    loss_types = {'l2': [{}],
-                  'ssim_time': [{}],
-                  'ssim_mel': n_fft_kwargs,
-                  'l1_mel': n_fft_kwargs,
-                  'l2_mel': n_fft_kwargs,
-                  'l1_fft': n_fft_kwargs,
-                  'l2_fft': n_fft_kwargs}
-    n_losses = sum([len(v) for v in loss_types.values()])
-    n_experiments = len(widths) * len(filter_lengths) * n_losses
-    n_done = 0
-    start_time = time.time()
-    for signal in train_set:
-        for width in widths:
-            for filter_length in filter_lengths:
-                for loss_type, loss_kwargs in loss_types.items():
-                    for loss_kwarg in loss_kwargs:
-                        exp_name = 'model_%s_width%i_filterlength%i_%s_%s' % (
-                            signal, width, filter_length, loss_type, re.sub(r"[ :'{}]", '', str(loss_kwarg)))
-                        if skip_existing and exp_name in results:
-                            print('already run %s. skipping' % exp_name)
-                            n_experiments -= 1
-                            continue
-                        print(exp_name)
-                        val_loss = train_model(exp_name=exp_name, width=width, filter_length=filter_length,
-                                               loss_type=loss_type, loss_kwargs=loss_kwarg, train_signal=signal)
-                        results[exp_name] = val_loss
-                        with open(results_json, 'w') as f:
-                            json.dump(results, f)
-                        n_done += 1
-                        eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
-                        hours = int(eta // 60)
-                        minutes = int(eta % 60)
-                        print('--------- Completed experiment %i of %i. ETA: %i:%i'
-                              % (n_done, n_experiments, hours, minutes))
-
-    print('Best result: %.4f validation loss in experiment %s' % (min(results.values()), min(results, key=results.get)))
-
-
-def hyperparam_search_melfilter(skip_existing=True):
-    """
-    try the fixed filter idea, compare with the wavenet results
-    """
-    results_json = os.path.join(BASE_DIR, 'hyperparams_losses_melfilter_final22100.json')
-    if os.path.isfile(results_json) and skip_existing:
-        with open(results_json, 'r') as f:
-            results = json.load(f)
-    else:
-        results = {}
-    widths = [30]  # [30, 40, 50]
-    depths = [9]  # [5, 7, 9]
-    filter_lengths = [64]  # 64 is better than 256
-    signals = ['di']
-    n_ffts = [8192]
+    models = ['fixedfilter', 'blender']
+    widths = [30, 40]
+    depths = [7, 9]
+    filter_lengths = [128, 256]
+    amps = ['5150', 'ac30', 'twin']  # ['5150', 'ac30', 'jcm800', 'plexi', 'recto', 'twin']
+    n_ffts = [8192, 8192*2]
     time_weights = [0.1]
-    n_fft_kwargs = [{'n_ffts': n_fft} for n_fft in n_ffts]
-    loss_types = {'l1_mel_l2_time': [{'n_ffts': n_fft, 'time_weight': time_weight}
-                                     for n_fft in n_ffts for time_weight in time_weights]}
+    loss_types = {'blend': [{'n_ffts': n_fft, 'time_weight': time_weight}
+                            for n_fft in n_ffts for time_weight in time_weights]}
     n_losses = sum([len(v) for v in loss_types.values()])
-    biases = [True]  # definitely needs bias
-    fmins = [40]  # [20, 40]
-    n_experiments = len(widths) * len(depths) * len(filter_lengths) * len(signals) * n_losses * len(fmins)
+    fmins = [40]
+    fmaxs = [20000, 16000]
+    n_experiments = len(models) * len(widths) * len(depths) * len(filter_lengths) * len(amps) * n_losses * len(fmins)
     n_done = 0
     start_time = time.time()
-    for width in widths[::-1]:
-        for depth in depths[::-1]:
-            for filter_length in filter_lengths[::-1]:
-                for signal in signals:
-                    for loss_type, loss_kwargs in loss_types.items():
-                        for loss_kwarg in loss_kwargs:
-                            for fmin in fmins:
-                                print(loss_kwarg)
-                                bias = True
-                                exp_name = 'melfilter_fmin%i_n2048_tanh_bias%s_%s_width%i_depth%i_filterlength%i_%s_%s_final22100' % (
-                                    fmin, str(bias), signal, width, depth, filter_length, loss_type,
-                                    re.sub(r"[ :'{,}]", '', str(loss_kwarg)))
-                                if skip_existing and exp_name in results:
-                                    print('already run %s. skipping' % exp_name)
-                                    n_experiments -= 1
-                                    continue
-                                print(exp_name)
-                                model_kwargs = {'width': width, 'depth': depth, 'filter_length': filter_length,
-                                                'bias': bias, 'f_min': fmin}
-                                failed_experiments = 0
-                                lr = 1e-2
-                                while failed_experiments < 5:
-                                    val_loss = train_model(exp_name=exp_name, modeltype='melfilter',
-                                                           model_kwargs=model_kwargs, loss_type=loss_type,
-                                                           loss_kwargs=loss_kwarg, train_signal=signal, learnrate=lr)
-                                    if np.isfinite(val_loss):
-                                        break
-                                    else:
-                                        print('NaN/Inf loss. Re-running with lower learning rate')
-                                        failed_experiments += 1
-                                        lr = lr/10.
-                                results[exp_name] = val_loss
-                                with open(results_json, 'w') as f:
-                                    json.dump(results, f)
-                                n_done += 1
-                                eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
-                                hours = int(eta // 60)
-                                minutes = int(eta % 60)
-                                print('--------- Completed experiment %i of %i. ETA: %i:%i'
-                                      % (n_done, n_experiments, hours, minutes))
+    for modeltype in models:
+        for amp in amps:
+            for width in widths[::-1]:
+                for depth in depths[::-1]:
+                    for filter_length in filter_lengths[::-1]:
+                        for loss_type, loss_kwargs in loss_types.items():
+                            for loss_kwarg in loss_kwargs:
+                                for fmin in fmins:
+                                    for fmax in fmaxs:
+                                        exp_name = '%s_%s_fmin%i_fmax%ik_n2048_w%i_d%i_fl%i_%s_%s' % (
+                                            modeltype, amp, fmin, fmax//1000, width, depth, filter_length,
+                                            re.sub(r"[_]", '', loss_type),
+                                            re.sub(r"[ :'{,_}]", '', str(loss_kwarg)))
+                                        if skip_existing and exp_name in results:
+                                            print('already run %s. skipping' % exp_name)
+                                            n_experiments -= 1
+                                            continue
+                                        print(exp_name)
+                                        model_kwargs = {'width': width, 'depth': depth, 'filter_length': filter_length,
+                                                        'bias': True, 'f_min': fmin, 'f_max': fmax}
+                                        failed_experiments = 0
+                                        lr = 1e-2
+                                        while failed_experiments < 5:
+                                            val_loss = train_model(amp=amp, exp_name=exp_name, modeltype=modeltype,
+                                                                   model_kwargs=model_kwargs, loss_type=loss_type,
+                                                                   loss_kwargs=loss_kwarg, learnrate=lr)
+                                            if np.isfinite(val_loss):
+                                                break
+                                            else:
+                                                print('NaN/Inf loss. Re-running with lower learning rate')
+                                                failed_experiments += 1
+                                                lr = lr/10.
+                                        results[exp_name] = val_loss
+                                        with open(results_json, 'w') as f:
+                                            json.dump(results, f)
+                                        n_done += 1
+                                        eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
+                                        hours = int(eta // 60)
+                                        minutes = int(eta % 60)
+                                        print('--------- Completed experiment %i of %i. ETA: %i:%i'
+                                              % (n_done, n_experiments, hours, minutes))
 
     # exclude other metrics for now
     results = {k: v for k, v in results.items() if 'l1_mel_n_ffts8192' in k}
     print('Best result: %.4f validation loss in experiment %s' % (min(results.values()), min(results, key=results.get)))
 
 
-def hyperparam_search_crossover(skip_existing=True):
-    """
-    try the crossover distortion idea (heavily modified melfilter network)
-    """
-    results_json = os.path.join(BASE_DIR, 'hyperparams_losses_crossover.json')
+def hyperparam_search_iir(skip_existing=True):
+    results_json = os.path.join(BASE_DIR, 'results_44100_iir.json')
     if os.path.isfile(results_json) and skip_existing:
         with open(results_json, 'r') as f:
             results = json.load(f)
     else:
         results = {}
-    widths = [10, 20, 30]
-    depths = [3, 4, 5]
-    filter_lengths = [64]  # 64 is better than 256
-    signals = ['di']
-    n_ffts = [8192]
-    n_fft_kwargs = [{'n_ffts': n_fft} for n_fft in n_ffts]
-    loss_types = {'l1_mel': n_fft_kwargs}
+    models = ['blender']  # ['fixedfilter', 'blender']
+    widths = [6]
+    depths = [5]  # [3, 5, 7, 9]
+    filter_lengths = [7]
+    amps = ['5150']  # ['5150', 'ac30', 'twin']  # ['5150', 'ac30', 'jcm800', 'plexi', 'recto', 'twin']
+    n_ffts = [8192]  # [8192, 8192*2]
+    time_weights = [0.1]  # [0.1]
+    loss_types = {'blend': [{'n_ffts': n_fft, 'time_weight': time_weight}
+                            for n_fft in n_ffts for time_weight in time_weights]}
     n_losses = sum([len(v) for v in loss_types.values()])
-    biases = [True]  # definitely needs bias
-    n_experiments = len(widths) * len(depths) * len(filter_lengths) * len(signals) * n_losses * len(biases)
+    fmins = [60]
+    fmaxs = [12000]
+    n_experiments = len(models) * len(widths) * len(depths) * len(filter_lengths) * len(amps) * n_losses * len(fmins)
     n_done = 0
     start_time = time.time()
-    for width in widths[::-1]:
-        for depth in depths[::-1]:
-            for filter_length in filter_lengths[::-1]:
-                for signal in signals:
-                    for loss_type, loss_kwargs in loss_types.items():
-                        for loss_kwarg in loss_kwargs:
-                            for bias in biases:
-                                print(loss_kwarg)
-                                exp_name = 'crossover_%s_width%i_depth%i_filterlength%i_%s_%s' % (
-                                    signal, width, depth, filter_length, loss_type,
-                                    re.sub(r"[ :'{}]", '', str(loss_kwarg)))
-                                if skip_existing and exp_name in results:
-                                    print('already run %s. skipping' % exp_name)
-                                    n_experiments -= 1
-                                    continue
-                                print(exp_name)
-                                model_kwargs = {'width': width, 'depth': depth, 'filter_length': filter_length,
-                                                'bias': bias}
-                                failed_experiments = 0
-                                lr = 1e-2
-                                while failed_experiments < 5:
-                                    val_loss = train_model(exp_name=exp_name, modeltype='crossover',
-                                                           model_kwargs=model_kwargs, loss_type=loss_type,
-                                                           loss_kwargs=loss_kwarg, train_signal=signal, learnrate=lr)
-                                    if np.isfinite(val_loss):
-                                        break
-                                    else:
-                                        print('NaN/Inf loss. Re-running with lower learning rate')
-                                        failed_experiments += 1
-                                        lr = lr/10.
-                                results[exp_name] = val_loss
-                                with open(results_json, 'w') as f:
-                                    json.dump(results, f)
-                                n_done += 1
-                                eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
-                                hours = int(eta // 60)
-                                minutes = int(eta % 60)
-                                print('--------- Completed experiment %i of %i. ETA: %i:%i'
-                                      % (n_done, n_experiments, hours, minutes))
+    for modeltype in models:
+        for amp in amps:
+            for width in widths[::-1]:
+                for depth in depths[::-1]:
+                    for filter_length in filter_lengths[::-1]:
+                        for loss_type, loss_kwargs in loss_types.items():
+                            for loss_kwarg in loss_kwargs:
+                                for fmin in fmins:
+                                    for fmax in fmaxs:
+                                        exp_name = 'iir_%s_%s_fmin%i_fmax%ik_n2048_w%i_d%i_fl%i_%s_%s' % (
+                                            modeltype, amp, fmin, fmax//1000, width, depth, filter_length,
+                                            re.sub(r"[_]", '', loss_type),
+                                            re.sub(r"[ :'{,_}]", '', str(loss_kwarg)))
+                                        if skip_existing and exp_name in results:
+                                            print('already run %s. skipping' % exp_name)
+                                            n_experiments -= 1
+                                            continue
+                                        print(exp_name)
+                                        model_kwargs = {'width': width, 'depth': depth, 'filter_length': filter_length,
+                                                        'bias': True, 'f_min': fmin, 'f_max': fmax,
+                                                        'filter_type': 'iir'}
+                                        failed_experiments = 0
+                                        lr = 1e-4
+                                        while failed_experiments < 3:
+                                            val_loss = train_model(amp=amp, exp_name=exp_name, modeltype=modeltype,
+                                                                   model_kwargs=model_kwargs, loss_type=loss_type,
+                                                                   loss_kwargs=loss_kwarg, learnrate=lr)
+                                            if np.isfinite(val_loss):
+                                                break
+                                            else:
+                                                print('NaN/Inf loss. Re-running with lower learning rate')
+                                                failed_experiments += 1
+                                                lr = lr/10.
+                                        results[exp_name] = val_loss
+                                        with open(results_json, 'w') as f:
+                                            json.dump(results, f)
+                                        n_done += 1
+                                        eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
+                                        hours = int(eta // 60)
+                                        minutes = int(eta % 60)
+                                        print('--------- Completed experiment %i of %i. ETA: %i:%i'
+                                              % (n_done, n_experiments, hours, minutes))
 
-    # exclude other metrics for now
-    results = {k: v for k, v in results.items() if 'l1_mel_n_ffts8192' in k}
     print('Best result: %.4f validation loss in experiment %s' % (min(results.values()), min(results, key=results.get)))
-
