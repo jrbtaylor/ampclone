@@ -4,7 +4,7 @@ import torch.nn as nn
 import torchaudio
 
 from melfilters import gabor
-from filterbank import filterbank_iir
+from filterbank import filterbank_iir, filterbank_fir
 from iir_ops import m_lfilter
 
 
@@ -86,15 +86,16 @@ class WaveNet(nn.Module):
         return self.mixer(outputs)
 
 
-class MelFilter(nn.Module):
-    def __init__(self, n_filters, f_min, f_max, fs, filter_length):
-        super(MelFilter, self).__init__()
-        filters = np.array(gabor(n_filters, f_min, f_max, fs, filter_length))
+class FIRFilter(nn.Module):
+    def __init__(self, n_filters, f_min, f_max, fs, max_delay):
+        super(FIRFilter, self).__init__()
+        filters = np.array(filterbank_fir(n_filters, f_min, f_max, fs, max_delay, min_phase=False))
+        print('INFO: filter_length arg is currently ignored for filterbank_fir call')
         # expand dims so filters is shaped (n_filters, in_channels=1, filter_length)
         filters = np.expand_dims(filters, axis=1)
         self.filters = torch.nn.Parameter(torch.from_numpy(filters).type(torch.get_default_dtype()),
                                           requires_grad=False)
-        self.pad = nn.ConstantPad1d((filter_length - 1, 0), 0.)
+        self.pad = nn.ConstantPad1d((filters.shape[-1] - 1, 0), 0.)
 
     def forward(self, x):
         x = self.pad(x)
@@ -133,15 +134,17 @@ class IIRFilter(nn.Module):
 
 class FixedFilters(nn.Module):
     def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
-                 f_min=40, f_max=10000, fs=44100, bias=True, filter_type='mel'):
+                 f_min=40, f_max=16000, fs=44100, bias=True, filter_type='fir'):
         """
         Notes:  - bias is significantly better than no bias
                 - filter lengths 64 and 128 is noticeably better than 128, 256 or 32 (at 22.1 kHz fs)
         """
         super(FixedFilters, self).__init__()
         self.filter_type = filter_type
-        if filter_type == 'mel':
-            self.filters = MelFilter(width, f_min, f_max, fs, filter_length)
+        if filter_type == 'fir':
+            max_delay = 0.002 * fs * 0.9 / depth  # 2 millisecond delay * sample freq * 0.9 crap factor, per layer
+            print('INFO: filter_length arg is ignored for FIR filter. Filter length is set automatically for depth')
+            self.filters = FIRFilter(width, f_min, f_max, fs, max_delay)
         else:  # IIR filter
             self.filters = nn.ModuleList([IIRFilter(width // 2, f_min, f_max, fs, filter_length),
                                           IIRFilter(width, f_min, f_max, fs, filter_length)])
@@ -150,7 +153,7 @@ class FixedFilters(nn.Module):
         self.depth = depth
 
         for d in range(depth):
-            if self.filter_type == 'mel':
+            if self.filter_type == 'fir':
                 conv_layer = torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias)
             else:
                 conv_layer = torch.nn.Conv1d(width // 2 if d % 2 == 0 else width, 1, kernel_size=1, stride=1, bias=bias)
@@ -163,7 +166,7 @@ class FixedFilters(nn.Module):
 
     def forward(self, x):
         for idx in range(self.depth):
-            if self.filter_type == 'mel':
+            if self.filter_type == 'fir':
                 x = self.filters(x)
             else:
                 x = self.filters[idx % len(self.filters)](x)
@@ -175,14 +178,16 @@ class FixedFilters(nn.Module):
 
 class Blender(nn.Module):
     def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
-                 f_min=40, f_max=20000, fs=44100, bias=True, filter_type='mel'):
+                 f_min=40, f_max=16000, fs=44100, bias=True, filter_type='fir'):
         """
         Similar to FixedFilters model but each layer has a learned "blend" parameter that blends its input and output
         """
         super(Blender, self).__init__()
         self.filter_type = filter_type
-        if filter_type == 'mel':
-            self.filters = MelFilter(width, f_min, f_max, fs, filter_length)
+        if filter_type == 'fir':
+            max_delay = 0.002*fs*0.9/depth  # 2 millisecond delay * sample freq * 0.9 crap factor, per layer
+            print('INFO: filter_length arg is ignored for FIR filter. Filter length is set automatically for depth')
+            self.filters = FIRFilter(width, f_min, f_max, fs, max_delay)
         else:  # IIR filter
             self.filters = nn.ModuleList([IIRFilter(width // 2, f_min, f_max, fs, filter_length),
                                           IIRFilter(width, f_min, f_max, fs, filter_length)])
@@ -193,7 +198,7 @@ class Blender(nn.Module):
         self.blend_sigmoid = torch.nn.Sigmoid()
 
         for d in range(depth):
-            if self.filter_type == 'mel':
+            if self.filter_type == 'fir':
                 conv_layer = torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias)
             else:
                 conv_layer = torch.nn.Conv1d(width // 2 if d % 2 == 0 else width, 1, kernel_size=1, stride=1, bias=bias)
@@ -209,7 +214,7 @@ class Blender(nn.Module):
 
     def forward(self, x):
         for idx in range(self.depth):
-            if self.filter_type == 'mel':
+            if self.filter_type == 'fir':
                 y = self.filters(x)
             else:
                 y = self.filters[idx % len(self.filters)](x)
@@ -253,10 +258,14 @@ class Prefiltered(nn.Module):
 
 
 class Crossover(nn.Module):
+    """
+    Designed to allow easy modeling of crossover distortion from class A/B power section
+    """
     def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
                  f_min=40, f_max=10000, fs=44100, bias=True):
         super(Crossover, self).__init__()
-        self.filters = MelFilter(width, f_min, f_max, fs, filter_length)
+        raise NotImplementedError('need to update crossover model call to FIRFilter')
+        self.filters = FIRFilter(width, f_min, f_max, fs, filter_length)
         self.recombines = nn.ModuleList()
         self.eqs = nn.ModuleList()
         self.activation = ACTIVATIONS[activation]
