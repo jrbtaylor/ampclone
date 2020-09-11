@@ -15,7 +15,7 @@ import losses
 import utils
 
 BASE_DIR = '/home/jtaylor/cloner/'  # 'C:/Users/Jason/Documents/cloner/'
-IR_FILE = BASE_DIR+'IR/OH_212_ORNG_V30+M25_PROG-05_32bit_44100.wav'
+IR_FILE = BASE_DIR + 'IR/OH_212_ORNG_V30+M25_PROG-05_32bit_44100.wav'
 FS = 44100
 
 if torch.cuda.is_available():
@@ -81,7 +81,7 @@ def train_model(exp_name='model', amp='jcm800', modeltype='blender', model_kwarg
     if apply_ir:
         ir, ir_fs = utils.load_wav(IR_FILE)
         assert ir_fs == FS
-        print('IR shape: '+str(ir.shape))
+        print('IR shape: ' + str(ir.shape))
 
     if prefiltered:
         data_dir = os.path.join(BASE_DIR, 'data_%i' % FS)
@@ -110,18 +110,24 @@ def train_model(exp_name='model', amp='jcm800', modeltype='blender', model_kwarg
     net.to(DEVICE)
 
     criterion = losses.Loss(loss_type, loss_kwargs)
-    optimizer = optim.Adam(net.parameters(), lr=learnrate)
+    # optimizer = optim.Adam(net.parameters(), lr=learnrate)
     # TODO: debug filtering lists of parameters to train some with lower learning rates
-    # if hasattr(net, 'slow_parameters'):
-    #     regular_parameters = [param for param in net.parameters() if param not in net.slow_parameters]
-    #     optimizer = optim.Adam([
-    #         {'params': net.slow_parameters, 'lr': 1e-2 * learnrate},
-    #         {'params': regular_parameters, 'lr': learnrate}
-    #     ])
-    # else:
-    #     optimizer = optim.Adam(net.parameters(), lr=learnrate)
+    if hasattr(net, 'slow_parameters'):
+        regular_parameters = [param for param in net.parameters() if param not in net.slow_parameters]
+        optimizer = optim.Adam([
+            {'params': net.slow_parameters, 'lr': 1e-2 * learnrate},
+            {'params': regular_parameters, 'lr': learnrate}
+        ])
+    else:
+        optimizer = optim.Adam(net.parameters(), lr=learnrate)
 
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, 0.95)
+
+    # Regularizers:
+    phase_loss = False
+    if 'learn_filters' in model_kwargs:
+        if model_kwargs['learn_filters']:
+            phase_loss = True
 
     train_losses = []
     val_losses = []
@@ -140,14 +146,24 @@ def train_model(exp_name='model', amp='jcm800', modeltype='blender', model_kwarg
             optimizer.zero_grad()
             outputs = net(inputs)
             loss = criterion(outputs, labels)
+            if phase_loss:
+                phs_lss = losses.phase_loss(net)
+                loss += 0.1*phs_lss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
             optimizer.step()
 
             epoch_losses.append(loss.item())
             elapsed = time.time() - start_time
-            utils.clear_print('training step %i    loss = %.4f    elapsed = %.2f minutes    ETA = %.2f minutes'
-                              % (i, loss.item(), elapsed / 60, (len(train_loader) - i - 1) * elapsed / (i + 1) / 60))
+            if phase_loss:
+                utils.clear_print(
+                    'training step %i    loss = %.4f    phase = %.4f    elapsed = %.2f minutes    ETA = %.2f minutes'
+                    % (i, loss.item(), phs_lss.item(), elapsed / 60,
+                       (len(train_loader) - i - 1) * elapsed / (i + 1) / 60))
+            else:
+                utils.clear_print('training step %i    loss = %.4f    elapsed = %.2f minutes    ETA = %.2f minutes'
+                                  % (i, loss.item(), elapsed / 60,
+                                     (len(train_loader) - i - 1) * elapsed / (i + 1) / 60))
             # print('\n' + str([(np.min(layer.weight.data.cpu().numpy()), np.max(layer.weight.data.cpu().numpy()))
             #                   for layer in net.recombines]))
             if not np.isfinite(loss.item()):
@@ -155,7 +171,11 @@ def train_model(exp_name='model', amp='jcm800', modeltype='blender', model_kwarg
                 if epoch < early_stopping:
                     return np.inf
                 return best_val[1]
-        utils.clear_print('Epoch %i: training loss = %.4f' % (epoch, np.mean(epoch_losses)), end='\n')
+        if phase_loss:
+            utils.clear_print('Epoch %i: training loss = %.4f     phase loss = %.4f'
+                              % (epoch, np.mean(epoch_losses), phs_lss.item()), end='\n')
+        else:
+            utils.clear_print('Epoch %i: training loss = %.4f' % (epoch, np.mean(epoch_losses)), end='\n')
         train_losses.append(np.mean(epoch_losses))
 
         scheduler.step()
@@ -195,24 +215,28 @@ def train_model(exp_name='model', amp='jcm800', modeltype='blender', model_kwarg
 
 
 def hyperparam_search(skip_existing=True):
-    results_json = os.path.join(BASE_DIR, 'results_fir44100.json')
+    results_json = os.path.join(BASE_DIR, 'results_fir44100_learnfilters.json')
     if os.path.isfile(results_json) and skip_existing:
         with open(results_json, 'r') as f:
             results = json.load(f)
     else:
         results = {}
     models = ['blender']
-    depths = [5, 7, 9]
-    widths = [20, 30, 40]
-    fmins = [40, 80]
-    fmaxs = [16000, 18000]
+    depths = [3, 5, 7]  # [3, 5, 7, 9]
+    widths = [30, 40]  # [20, 30, 40]
+    fmins = [40]
+    fmaxs = [16000]  # [16000, 18000]
+    offsets = [1000., 2000.]
     amps = ['5150', 'twin']  # ['5150', 'ac30', 'jcm800', 'plexi', 'recto', 'twin']
+    windows = ['flattop', 'blackmanharris']
     n_ffts = [8192 * 2]  # [8192, 8192 * 2]
     time_weights = [0.1]
-    loss_types = {'blend': [{'n_ffts': n_fft, 'time_weight': time_weight}
-                            for n_fft in n_ffts for time_weight in time_weights]}
+    # loss_types = {'blend': [{'n_ffts': n_fft, 'time_weight': time_weight}
+    #                         for n_fft in n_ffts for time_weight in time_weights]}
+    loss_types = {'l2_mel': [{'n_ffts': n_fft} for n_fft in n_ffts]}
     n_losses = sum([len(v) for v in loss_types.values()])
-    n_experiments = len(models) * len(depths) * len(amps) * n_losses * len(widths)
+    n_experiments = len(models) * len(depths) * len(amps) * n_losses * len(widths) * len(fmins) * len(fmaxs) \
+                    * len(windows) * len(offsets)
     n_done = 0
     start_time = time.time()
     for modeltype in models:
@@ -221,38 +245,42 @@ def hyperparam_search(skip_existing=True):
                 for width in widths[::-1]:
                     for fmin in fmins:
                         for fmax in fmaxs:
-                            for loss_type, loss_kwargs in loss_types.items():
-                                for loss_kwarg in loss_kwargs:
-                                    exp_name = '%s_%s_d%i_w%i_fmin%i_fmax%ik_%s_%s' % (
-                                        amp, modeltype, depth, width, fmin, fmax//1000, re.sub(r"[_]", '', loss_type),
-                                        re.sub(r"[ :'{,_}]", '', str(loss_kwarg)))
-                                    if skip_existing and exp_name in results:
-                                        print('already run %s. skipping' % exp_name)
-                                        n_experiments -= 1
-                                        continue
-                                    print(exp_name)
-                                    model_kwargs = {'depth': depth, 'width': width, 'f_min': fmin, 'f_max': fmax,
-                                                    'fs': FS}
-                                    failed_experiments = 0
-                                    lr = 1e-2
-                                    while failed_experiments < 5:
-                                        val_loss = train_model(amp=amp, exp_name=exp_name, modeltype=modeltype,
-                                                               model_kwargs=model_kwargs, loss_type=loss_type,
-                                                               loss_kwargs=loss_kwarg, learnrate=lr)
-                                        if np.isfinite(val_loss):
-                                            break
-                                        else:
-                                            print('NaN/Inf loss. Re-running with lower learning rate')
-                                            failed_experiments += 1
-                                            lr = lr / 10.
-                                    results[exp_name] = val_loss
-                                    with open(results_json, 'w') as f:
-                                        json.dump(results, f)
-                                    n_done += 1
-                                    eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
-                                    hours = int(eta // 60)
-                                    minutes = int(eta % 60)
-                                    print('--------- Completed experiment %i of %i. ETA: %i:%i'
-                                          % (n_done, n_experiments, hours, minutes))
+                            for window in windows:
+                                for offset in offsets:
+                                    for loss_type, loss_kwargs in loss_types.items():
+                                        for loss_kwarg in loss_kwargs:
+                                            exp_name = '%s_%s_learnfilt_d%i_w%i_%s_fmin%i_fmax%ik__offset%i_%s_%s' % (
+                                                amp, modeltype, depth, width, window, fmin, fmax // 1000, offset,
+                                                re.sub(r"[_]", '', loss_type),
+                                                re.sub(r"[ :'{,_}]", '', str(loss_kwarg)))
+                                            if skip_existing and exp_name in results:
+                                                print('already run %s. skipping' % exp_name)
+                                                n_experiments -= 1
+                                                continue
+                                            print(exp_name)
+                                            model_kwargs = {'depth': depth, 'width': width, 'f_min': fmin,
+                                                            'f_max': fmax, 'fs': FS, 'window': window, 'offset': offset,
+                                                            'learn_filters': True}
+                                            failed_experiments = 0
+                                            lr = 1e-3  # was 1e-2 before using learned filters
+                                            while failed_experiments < 5:
+                                                val_loss = train_model(amp=amp, exp_name=exp_name, modeltype=modeltype,
+                                                                       model_kwargs=model_kwargs, loss_type=loss_type,
+                                                                       loss_kwargs=loss_kwarg, learnrate=lr)
+                                                if np.isfinite(val_loss):
+                                                    break
+                                                else:
+                                                    print('NaN/Inf loss. Re-running with lower learning rate')
+                                                    failed_experiments += 1
+                                                    lr = lr / 10.
+                                            results[exp_name] = val_loss
+                                            with open(results_json, 'w') as f:
+                                                json.dump(results, f)
+                                            n_done += 1
+                                            eta = (time.time() - start_time) / n_done * (n_experiments - n_done) / 60.
+                                            hours = int(eta // 60)
+                                            minutes = int(eta % 60)
+                                            print('--------- Completed experiment %i of %i. ETA: %i:%i'
+                                                  % (n_done, n_experiments, hours, minutes))
 
     print('Best result: %.4f validation loss in experiment %s' % (min(results.values()), min(results, key=results.get)))

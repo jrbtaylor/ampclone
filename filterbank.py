@@ -1,6 +1,6 @@
 import numpy as np
 import scipy.signal
-from scipy.signal import firwin, firwin2
+from scipy.signal import firwin, remez
 
 
 def filterbank_iir(n_filters, f_min, f_max, fs, filter_order=3):
@@ -33,11 +33,11 @@ def filterbank_iir(n_filters, f_min, f_max, fs, filter_order=3):
     return filters
 
 
-def _fir(n_filters, filter_order, bands, f_min, fs, min_phase=False):
+def _fir(n_filters, filter_order, bands, f_min, fs, window='blackmanharris', min_phase=False):
     filters = []
     group_delays = []
     for idx in range(n_filters):
-        h = firwin(filter_order, (bands[idx], bands[idx + 1]), pass_zero='bandpass', fs=fs, window='triang')
+        h = firwin(filter_order, (bands[idx], bands[idx + 1]), pass_zero='bandpass', fs=fs, window=window)
         if min_phase:
             h = scipy.signal.minimum_phase(h)
         filters.append(h)
@@ -48,24 +48,45 @@ def _fir(n_filters, filter_order, bands, f_min, fs, min_phase=False):
     return filters, group_delays
 
 
-def filterbank_fir(n_filters, f_min, f_max, fs, max_delay, min_phase=False, offset=250):
-    filter_order = 211
-    if not min_phase:
-        filter_order = (filter_order-1)/2
+# def _fir(n_filters, filter_order, bands, f_min, fs, window='triang', min_phase=False):
+#     filters = []
+#     group_delays = []
+#     for idx in range(n_filters):
+#         if idx == 0:
+#             b = [0., bands[idx]//2, bands[idx], bands[idx + 1], bands[idx + 2], fs/2]
+#         elif idx < n_filters-1:
+#             b = [0., bands[idx - 1], bands[idx], bands[idx + 1], bands[idx + 2], fs/2]
+#         else:  # highest freq
+#             b = [0., bands[idx - 1], bands[idx], bands[idx + 1], 0.5*(bands[idx + 1]+fs/2), fs/2]
+#         h = remez(filter_order, b, [0, 1, 0], fs=fs, maxiter=100, grid_density=256, type='hilbert')
+#         if min_phase:
+#             h = scipy.signal.minimum_phase(h)
+#         filters.append(h)
+#
+#         freq, delay = scipy.signal.group_delay((h, 1.), w=2048 * 16, fs=fs)
+#         delay = np.max(delay[np.where(np.greater(freq, f_min))])
+#         group_delays.append(delay)
+#     return filters, group_delays
 
+
+def filterbank_fir(n_filters, f_min, f_max, fs, max_delay, window='hann', min_phase=False, offset=250):
+    filter_order = 100
+
+    print('Window function: '+str(window)+' '*8+'Offset: '+str(offset))
     bands = np.geomspace(f_min+offset, f_max+offset, n_filters+1, endpoint=True)-offset
     print(bands)
 
     while True:
-        filters, group_delays = _fir(n_filters, filter_order, bands, f_min, fs, min_phase)
+        filters, group_delays = _fir(n_filters, filter_order, bands, f_min, fs, window, min_phase)
         if np.max(group_delays) > max_delay:
-            filter_order = filter_order-2
+            filter_order = filter_order-1
         else:
             break
 
     if min_phase:
         print(group_delays)
     print('max group delay: ' + str(np.max(group_delays)))
+    print('filter length: ' + str(filters[0].size))
 
     return filters
 
@@ -78,7 +99,7 @@ def vis_filters():
     import matplotlib.pyplot as plt
     fig, axs = plt.subplots(4)
     fs = 44100
-    filters = filterbank_fir(20, 80., 16000., fs, 12)
+    filters = filterbank_fir(30, 80., 16000., fs, fs*2e-3/7)
 
     # hp = scipy.signal.minimum_phase(
     #     firwin(85, 80., pass_zero='highpass', fs=fs, window='boxcar'))

@@ -95,3 +95,23 @@ class Loss(nn.Module):
 
     def forward(self, pred, label):
         return self.loss_fn(pred, label)
+
+
+def phase_loss(net):
+    filters = net.filters.filters
+    real = torch.reshape(filters, [-1, filters.shape[-1]])  # n_filters x filter_length
+    # zero-pad for additional freq resolution
+    zeros = torch.zeros([real.shape[0], 512-real.shape[-1]])
+    real = torch.cat([real, zeros], dim=-1)
+
+    # concat zeros for imaginary part for FFT
+    imag = torch.zeros_like(real)
+    comp_filters = torch.stack([real, imag], dim=-1)  # n_filters x filter_length x 2
+    fft = torch.Tensor.fft(comp_filters, 1)
+    phase = torch.atan2(fft[:, :, 1], fft[:, :, 0])
+
+    # estimate group delay (derivative of phase wrt freq) by finite differences
+    group_delay = phase[:, 1:]-phase[:, :-1]
+    group_delay = torch.fmod(group_delay+np.pi, 2*np.pi)-np.pi  # range: [-pi, pi]
+
+    return torch.var(group_delay)

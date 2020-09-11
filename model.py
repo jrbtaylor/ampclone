@@ -20,6 +20,7 @@ def get_model(model_type, model_kwargs):
               'fixedfilter': FixedFilters,
               'crossover': Crossover,
               'blender': Blender,
+              'blenderv2': BlenderV2,
               'prefiltered': Prefiltered}
     return models[model_type](**model_kwargs)
 
@@ -87,14 +88,15 @@ class WaveNet(nn.Module):
 
 
 class FIRFilter(nn.Module):
-    def __init__(self, n_filters, f_min, f_max, fs, max_delay):
+    def __init__(self, n_filters, f_min, f_max, fs, max_delay, window='triang', offset=250, learn_filters=False):
         super(FIRFilter, self).__init__()
-        filters = np.array(filterbank_fir(n_filters, f_min, f_max, fs, max_delay, min_phase=False))
+        filters = np.array(filterbank_fir(n_filters, f_min, f_max, fs, max_delay, window=window, offset=offset,
+                                          min_phase=False))
         print('INFO: filter_length arg is currently ignored for filterbank_fir call')
         # expand dims so filters is shaped (n_filters, in_channels=1, filter_length)
         filters = np.expand_dims(filters, axis=1)
         self.filters = torch.nn.Parameter(torch.from_numpy(filters).type(torch.get_default_dtype()),
-                                          requires_grad=False)
+                                          requires_grad=learn_filters)
         self.pad = nn.ConstantPad1d((filters.shape[-1] - 1, 0), 0.)
 
     def forward(self, x):
@@ -178,7 +180,8 @@ class FixedFilters(nn.Module):
 
 class Blender(nn.Module):
     def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
-                 f_min=40, f_max=16000, fs=44100, bias=True, filter_type='fir'):
+                 f_min=40, f_max=16000, fs=44100, bias=True, filter_type='fir', window='triang', offset=250,
+                 learn_filters=False):
         """
         Similar to FixedFilters model but each layer has a learned "blend" parameter that blends its input and output
         """
@@ -187,11 +190,70 @@ class Blender(nn.Module):
         if filter_type == 'fir':
             max_delay = 0.002*fs*0.9/depth  # 2 millisecond delay * sample freq * 0.9 crap factor, per layer
             print('INFO: filter_length arg is ignored for FIR filter. Filter length is set automatically for depth')
-            self.filters = FIRFilter(width, f_min, f_max, fs, max_delay)
+            self.filters = FIRFilter(width, f_min, f_max, fs, max_delay, window=window, offset=offset,
+                                     learn_filters=learn_filters)
         else:  # IIR filter
             self.filters = nn.ModuleList([IIRFilter(width // 2, f_min, f_max, fs, filter_length),
                                           IIRFilter(width, f_min, f_max, fs, filter_length)])
         self.recombines = nn.ModuleList()
+        self.activation = ACTIVATIONS[activation]
+        self.depth = depth
+        self.blends = torch.nn.ParameterList()
+        self.blend_sigmoid = torch.nn.Sigmoid()
+        blend_init = 1.
+
+        if learn_filters:
+            self.slow_parameters = self.filters.filters
+        else:
+            self.slow_parameters = []
+
+        for d in range(depth):
+            if self.filter_type == 'fir':
+                conv_layer = torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias)
+            else:
+                conv_layer = torch.nn.Conv1d(width // 2 if d % 2 == 0 else width, 1, kernel_size=1, stride=1, bias=bias)
+            conv_layer.weight.data.fill_(1.)
+            if bias:
+                conv_layer.bias.data.fill_(0.)
+            self.recombines.append(conv_layer)
+            self.blends.append(
+                torch.nn.Parameter(torch.from_numpy(np.array(blend_init)).type(torch.get_default_dtype()),
+                                   requires_grad=True))
+        # output gain
+        self.output_gain = nn.Conv1d(1, 1, kernel_size=1, stride=1, bias=False)
+
+    def forward(self, x):
+        for idx in range(self.depth):
+            if self.filter_type == 'fir':
+                y = self.filters(x)
+            else:
+                y = self.filters[idx % len(self.filters)](x)
+            y = self.recombines[idx](y)
+            y = self.activation(y)
+            blend = self.blend_sigmoid(self.blends[idx])
+            x = (1-blend)*x+blend*y
+        x = self.output_gain(x)
+        return x
+
+
+class BlenderV2(nn.Module):
+    def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
+                 f_min=40, f_max=16000, fs=44100, bias=True, filter_type='fir', window='triang', offset=250):
+        """
+        Similar to FixedFilters model but each layer has a learned "blend" parameter that blends its input and output
+        """
+        super(BlenderV2, self).__init__()
+        self.filter_type = filter_type
+        if filter_type == 'fir':
+            max_delay = 0.002*fs*0.9/depth  # 2 millisecond delay * sample freq * 0.9 crap factor, per layer
+            print('INFO: filter_length arg is ignored for FIR filter. Filter length is set automatically for depth')
+            self.filters = FIRFilter(width, f_min, f_max, fs, max_delay, window=window, offset=offset)
+        else:  # IIR filter
+            self.filters = nn.ModuleList([IIRFilter(width // 2, f_min, f_max, fs, filter_length),
+                                          IIRFilter(width, f_min, f_max, fs, filter_length)])
+        self.recombines = nn.ModuleList()
+        self.gains = nn.ParameterList()
+        self.biases = nn.ParameterList()
         self.activation = ACTIVATIONS[activation]
         self.depth = depth
         self.blends = torch.nn.ParameterList()
@@ -209,6 +271,12 @@ class Blender(nn.Module):
             self.blends.append(
                 torch.nn.Parameter(torch.from_numpy(np.array(1.)).type(torch.get_default_dtype()),
                                    requires_grad=True))
+            self.gains.append(
+                nn.Parameter(torch.from_numpy(np.ones([1, width, 1])).type(torch.get_default_dtype()),
+                             requires_grad=True))
+            self.biases.append(
+                nn.Parameter(torch.from_numpy(np.zeros([1, width, 1])).type(torch.get_default_dtype()),
+                             requires_grad=True))
         # output gain
         self.output_gain = nn.Conv1d(1, 1, kernel_size=1, stride=1, bias=False)
 
@@ -218,6 +286,10 @@ class Blender(nn.Module):
                 y = self.filters(x)
             else:
                 y = self.filters[idx % len(self.filters)](x)
+            # difference for V2: each filtered component has activation applied separately, and again to sum
+            y = torch.mul(y, self.gains[idx])
+            y = torch.add(y, self.biases[idx])
+            y = self.activation(y)
             y = self.recombines[idx](y)
             y = self.activation(y)
             blend = self.blend_sigmoid(self.blends[idx])
