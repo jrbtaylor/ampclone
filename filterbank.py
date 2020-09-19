@@ -70,7 +70,7 @@ def _fir(n_filters, filter_order, bands, f_min, fs, window='blackmanharris', min
 
 
 def filterbank_fir(n_filters, f_min, f_max, fs, max_delay, window='hann', min_phase=False, offset=250):
-    filter_order = 100
+    filter_order = int(2*max_delay+1)  # 100
 
     print('Window function: '+str(window)+' '*8+'Offset: '+str(offset))
     bands = np.geomspace(f_min+offset, f_max+offset, n_filters+1, endpoint=True)-offset
@@ -83,8 +83,6 @@ def filterbank_fir(n_filters, f_min, f_max, fs, max_delay, window='hann', min_ph
         else:
             break
 
-    if min_phase:
-        print(group_delays)
     print('max group delay: ' + str(np.max(group_delays)))
     print('filter length: ' + str(filters[0].size))
 

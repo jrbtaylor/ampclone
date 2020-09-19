@@ -3,8 +3,7 @@ import torch.nn as nn
 import torch
 import torchaudio
 
-
-from utils import RATE
+from config import FS
 
 
 def _ssim_loss(x, y):
@@ -12,10 +11,11 @@ def _ssim_loss(x, y):
     mean_y = torch.mean(y)
     var_x = torch.var(x)
     var_y = torch.var(y)
-    cov = torch.mean(x*y)-mean_x*mean_y
-    c1, c2 = 0.01**2, 0.03**2
-    ssim = (2*mean_x*mean_y+c1)*(2*cov+c2)/(torch.square(mean_x)+torch.square(mean_y)+c1)/(var_x+var_y+c2)
-    return (1-ssim)/2
+    cov = torch.mean(x * y) - mean_x * mean_y
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    ssim = (2 * mean_x * mean_y + c1) * (2 * cov + c2) / (torch.square(mean_x) + torch.square(mean_y) + c1) / (
+            var_x + var_y + c2)
+    return (1 - ssim) / 2
 
 
 def _spectral_loss(diff, spec, n_ffts):
@@ -27,7 +27,7 @@ def _spectral_loss(diff, spec, n_ffts):
         for n_fft in n_ffts:
             # TODO: add frequency weighting based on perceptual sensitivity (https://en.wikipedia.org/wiki/Mel_scale)
             if spec == 'mel':
-                spec_fn = torchaudio.transforms.MelSpectrogram(sample_rate=RATE, n_fft=n_fft)
+                spec_fn = torchaudio.transforms.MelSpectrogram(sample_rate=FS, n_fft=n_fft)
             else:
                 spec_fn = torchaudio.transforms.Spectrogram(n_fft=n_fft)
             pred_spec = torch.log10(spec_fn(pred))
@@ -38,7 +38,8 @@ def _spectral_loss(diff, spec, n_ffts):
                 loss += nn.MSELoss(reduction='mean')(pred_spec, label_spec)
             elif diff == 'ssim':
                 loss += _ssim_loss(pred_spec, label_spec)
-        return loss/len(n_ffts)
+        return loss / len(n_ffts)
+
     return _loss_fn
 
 
@@ -76,7 +77,8 @@ def get_blend_loss(n_ffts, time_weight):
     mse_loss = get_mse_time_loss()
 
     def _blend(pred, label):
-        return l2_mel_loss(pred, label)+time_weight*mse_loss(pred, label)
+        return l2_mel_loss(pred, label) + time_weight * mse_loss(pred, label)
+
     return _blend
 
 
@@ -101,8 +103,8 @@ def phase_loss(net):
     filters = net.filters.filters
     real = torch.reshape(filters, [-1, filters.shape[-1]])  # n_filters x filter_length
     # zero-pad for additional freq resolution
-    zeros = torch.zeros([real.shape[0], 512-real.shape[-1]])
-    real = torch.cat([real, zeros], dim=-1)
+    # zeros = torch.zeros([real.shape[0], 64-real.shape[-1]])
+    # real = torch.cat([real, zeros], dim=-1)
 
     # concat zeros for imaginary part for FFT
     imag = torch.zeros_like(real)
@@ -111,7 +113,8 @@ def phase_loss(net):
     phase = torch.atan2(fft[:, :, 1], fft[:, :, 0])
 
     # estimate group delay (derivative of phase wrt freq) by finite differences
-    group_delay = phase[:, 1:]-phase[:, :-1]
-    group_delay = torch.fmod(group_delay+np.pi, 2*np.pi)-np.pi  # range: [-pi, pi]
+    group_delay = phase[:, 1:] - phase[:, :-1]
+    cos = torch.cos(group_delay)
+    sin = torch.sin(group_delay)
 
-    return torch.var(group_delay)
+    return torch.var(sin) + torch.var(cos)

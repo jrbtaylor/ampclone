@@ -92,16 +92,21 @@ class FIRFilter(nn.Module):
         super(FIRFilter, self).__init__()
         filters = np.array(filterbank_fir(n_filters, f_min, f_max, fs, max_delay, window=window, offset=offset,
                                           min_phase=False))
-        print('INFO: filter_length arg is currently ignored for filterbank_fir call')
+        # print('INFO: filter_length arg is currently ignored for filterbank_fir call')
         # expand dims so filters is shaped (n_filters, in_channels=1, filter_length)
         filters = np.expand_dims(filters, axis=1)
         self.filters = torch.nn.Parameter(torch.from_numpy(filters).type(torch.get_default_dtype()),
                                           requires_grad=learn_filters)
+        self.norm_filter = learn_filters  # if learning filter+eq, normalize to avoid scale being learned twice
         self.pad = nn.ConstantPad1d((filters.shape[-1] - 1, 0), 0.)
 
     def forward(self, x):
         x = self.pad(x)
-        return torch.nn.functional.conv1d(x, self.filters)
+        if self.norm_filter:
+            filters = self.filters / torch.sum(torch.square(self.filters), dim=-1, keepdim=True)
+        else:
+            filters = self.filters
+        return torch.nn.functional.conv1d(x, filters)
 
 
 class IIRFilter(nn.Module):
@@ -181,15 +186,14 @@ class FixedFilters(nn.Module):
 class Blender(nn.Module):
     def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
                  f_min=40, f_max=16000, fs=44100, bias=True, filter_type='fir', window='triang', offset=250,
-                 learn_filters=False):
+                 learn_filters=False, dropout_rate=0, max_delay_ms=6):
         """
         Similar to FixedFilters model but each layer has a learned "blend" parameter that blends its input and output
         """
         super(Blender, self).__init__()
         self.filter_type = filter_type
         if filter_type == 'fir':
-            max_delay = 0.002*fs*0.9/depth  # 2 millisecond delay * sample freq * 0.9 crap factor, per layer
-            print('INFO: filter_length arg is ignored for FIR filter. Filter length is set automatically for depth')
+            max_delay = max_delay_ms/1000*fs/depth  # per layer, in samples
             self.filters = FIRFilter(width, f_min, f_max, fs, max_delay, window=window, offset=offset,
                                      learn_filters=learn_filters)
         else:  # IIR filter
@@ -201,11 +205,10 @@ class Blender(nn.Module):
         self.blends = torch.nn.ParameterList()
         self.blend_sigmoid = torch.nn.Sigmoid()
         blend_init = 1.
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
 
         if learn_filters:
             self.slow_parameters = self.filters.filters
-        else:
-            self.slow_parameters = []
 
         for d in range(depth):
             if self.filter_type == 'fir':
@@ -220,7 +223,8 @@ class Blender(nn.Module):
                 torch.nn.Parameter(torch.from_numpy(np.array(blend_init)).type(torch.get_default_dtype()),
                                    requires_grad=True))
         # output gain
-        self.output_gain = nn.Conv1d(1, 1, kernel_size=1, stride=1, bias=False)
+        self.output_gain = nn.Parameter(torch.from_numpy(np.array(3.)).type(torch.get_default_dtype()),
+                                        requires_grad=True)
 
     def forward(self, x):
         for idx in range(self.depth):
@@ -228,11 +232,15 @@ class Blender(nn.Module):
                 y = self.filters(x)
             else:
                 y = self.filters[idx % len(self.filters)](x)
+
+            if self.dropout is not None:
+                y = self.dropout(y)
+
             y = self.recombines[idx](y)
             y = self.activation(y)
             blend = self.blend_sigmoid(self.blends[idx])
             x = (1-blend)*x+blend*y
-        x = self.output_gain(x)
+        x = self.output_gain*x
         return x
 
 
@@ -334,16 +342,28 @@ class Crossover(nn.Module):
     Designed to allow easy modeling of crossover distortion from class A/B power section
     """
     def __init__(self, width=20, depth=7, filter_length=64, activation='tanh',
-                 f_min=40, f_max=10000, fs=44100, bias=True):
+                 f_min=40, f_max=10000, fs=44100, bias=True, filter_type='fir', window='triang', offset=250,
+                 learn_filters=False, dropout_rate=0):
         super(Crossover, self).__init__()
-        raise NotImplementedError('need to update crossover model call to FIRFilter')
-        self.filters = FIRFilter(width, f_min, f_max, fs, filter_length)
+        if filter_type == 'fir':
+            max_delay = 0.002*fs*0.9/depth  # 2 millisecond delay * sample freq * 0.9 crap factor, per layer
+            print('INFO: filter_length arg is ignored for FIR filter. Filter length is set automatically for depth')
+            self.filters = FIRFilter(width, f_min, f_max, fs, max_delay, window=window, offset=offset,
+                                     learn_filters=learn_filters)
+        else:  # IIR filter
+            raise NotImplementedError('need to update crossover model call to IIR filter')
         self.recombines = nn.ModuleList()
         self.eqs = nn.ModuleList()
         self.activation = ACTIVATIONS[activation]
         self.biases = []
         self.gains = []
         self.depth = depth
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+
+        if learn_filters:
+            self.slow_parameters = self.filters.filters
+        else:
+            self.slow_parameters = []
 
         for d in range(depth):
             self.biases.append(nn.Parameter(torch.tensor([0.], requires_grad=True)))
@@ -378,6 +398,9 @@ class Crossover(nn.Module):
 
             x = x_pos-x_neg
             x = self.filters(x)
+            if self.dropout is not None:
+                x = self.dropout(x)
+
             x = self.eqs[idx](x)
             x = self.activation(x)
         x = self.output_gain(x)

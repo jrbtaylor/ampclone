@@ -1,13 +1,14 @@
 import numpy as np
 import scipy.io.wavfile
 
+from config import FS
+
 LEN_CLIP = 10
 LEN_SILENCE = 0.25
 OUTPUT_LEVELS = 40
-RATE = 44100
 
 
-def save_wav(data, filename, rate=RATE):
+def save_wav(data, filename, rate=FS):
     scipy.io.wavfile.write(filename, rate, data)
 
 
@@ -48,7 +49,7 @@ def find_latency(train_signal='chirp'):
     train_label = normalize(train_label)
     train_signal = normalize(train_signal)
 
-    max_shift = int(RATE * 3 * 1e-3)
+    max_shift = int(FS * 3 * 1e-3)
     shifts = np.arange(0, max_shift)
     mses = [np.mean(np.square(train_signal - train_label)) if shift == 0
             else np.mean(np.square(train_signal[shift:] - train_label[:-shift]))
@@ -63,12 +64,12 @@ def generate_noise(length, std=0.1):
 
 
 def generate_chirp(length, f_start, f_end, harmonic_ratio):
-    n_harmonics = int(np.floor(np.log2(RATE / 2 / max([f_start, f_end]))))
-    if max([f_start, f_end]) * 2 ** n_harmonics >= RATE / 2:
+    n_harmonics = int(np.floor(np.log2(FS / 2 / max([f_start, f_end]))))
+    if max([f_start, f_end]) * 2 ** n_harmonics >= FS / 2:
         raise ValueError('Cannot have %i harmonics. Highest frequency is above the Nyquist rate' % n_harmonics)
-    t = np.linspace(0, length, int(length * RATE))
-    f = np.linspace(f_start, f_end, int(length * RATE), endpoint=True)
-    signal = np.zeros(int(length * RATE), dtype='float')
+    t = np.linspace(0, length, int(length * FS))
+    f = np.linspace(f_start, f_end, int(length * FS), endpoint=True)
+    signal = np.zeros(int(length * FS), dtype='float')
     for h in range(n_harmonics):
         fh = f * 2 ** h
         signal += (harmonic_ratio ** h) * np.sin(2 * np.pi * fh * t)
@@ -82,13 +83,13 @@ def generate_train_signal(saveto):
     :param saveto: path to save training wav file
     :return:
     """
-    length = int((LEN_CLIP - LEN_SILENCE) * RATE)
+    length = int((LEN_CLIP - LEN_SILENCE) * FS)
     signal = []
     for std in np.logspace(-3.5, -1, OUTPUT_LEVELS, endpoint=True):
         signal.append(generate_noise(length, std=std))
-        signal.append(np.zeros([int(RATE * LEN_SILENCE)]))
+        signal.append(np.zeros([int(FS * LEN_SILENCE)]))
     signal = np.concatenate(signal)
-    save_wav(signal, saveto, RATE)
+    save_wav(signal, saveto, FS)
 
 
 def generate_train_signal2(saveto):
@@ -100,9 +101,9 @@ def generate_train_signal2(saveto):
         for i, std in enumerate(np.logspace(-3.5, -0.6, OUTPUT_LEVELS, endpoint=True)):
             x = np.sqrt(2) * std * chirp
             signal.append(x)
-            signal.append(np.zeros([int(RATE * LEN_SILENCE)]))
+            signal.append(np.zeros([int(FS * LEN_SILENCE)]))
     signal = np.concatenate(signal)
-    save_wav(signal, saveto, RATE)
+    save_wav(signal, saveto, FS)
 
 
 def prefilter(wav_file, saveto, n_filters=40, f_min=80, f_max=16000, fs=44100, truncate=True):
