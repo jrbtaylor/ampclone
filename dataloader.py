@@ -1,19 +1,5 @@
 import numpy as np
 import torch
-import torchaudio
-
-from config import FS
-
-
-# def test():
-#     import numpy as np
-#     x = torch.tensor(np.arange(100))
-#     y = torch.tensor(np.arange(100))
-#     dataset = AudioDataset([x, y], split_length=9)
-#     loader = torch.utils.data.DataLoader(dataset, batch_size=1)
-#     for _ in range(3):
-#         for i, data in enumerate(loader):
-#             print(str(i)+' '*4+str(data))
 
 
 class AudioDataset(torch.utils.data.TensorDataset):

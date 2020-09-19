@@ -106,27 +106,9 @@ def generate_train_signal2(saveto):
     save_wav(signal, saveto, FS)
 
 
-def prefilter(wav_file, saveto, n_filters=40, f_min=80, f_max=16000, fs=44100, truncate=True):
-    from filterbank import filterbank_iir
-    from scipy.signal import lfilter
-
-    signal, rate = load_wav(wav_file)
-    assert rate == fs
-
-    if truncate:
-        signal = signal[:signal.size//10]
-
-    filters = filterbank_iir(n_filters, f_min, f_max, fs)
-    for idx, (b, a) in enumerate(filters):
-        x = lfilter(b, a, signal)
-        assert np.all(np.isfinite(x))
-        save_wav(x, saveto + '_' + format(idx, '03') + '.wav', fs)
-
-
 def split_signal(data):
     # split_length = 96000  # this appears to be the limit for laptop cpu training
     split_length = int(np.ceil(data.size/(data.size//1e5)))  # limit for gpu training with FIR filter
-    # split_length = int(np.ceil(data.size / (data.size // 2e4)))  # Try this for prefiltered signals
     if data.size % split_length != 0:
         data = np.concatenate([data, np.zeros(split_length - (data.size % split_length), dtype=data.dtype)], axis=0)
     data = np.array(np.split(data, np.ceil(data.size / split_length)))

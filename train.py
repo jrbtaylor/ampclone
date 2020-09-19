@@ -1,14 +1,12 @@
 import json
-import glob
 import os
 import re
 import time
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
 import model
 import losses
@@ -17,56 +15,46 @@ from dataloader import AudioDataset
 from config import BASE_DIR, IR_FILE, FS, DEVICE, SPLIT_LENGTH, VAL_SPLIT_LENGTH
 
 
-def get_dataloader(input_path, label_path, batchsize=1, is_training=False):
+def get_dataloader(input_path, label_path, batchsize=1, is_training=False, label_offset=0):
     input_signal, signal_rate = utils.load_wav(input_path)
     label_signal, label_rate = utils.load_wav(label_path)
 
     assert (signal_rate == label_rate)
     # truncate label if it's somehow longer (reaper might've padded it)
     label_signal = label_signal[:input_signal.size]
+
+    # new experimental feature: offset label to account for recording latency
+    label_signal = label_signal[label_offset:]   # shift
+    input_signal = input_signal[:-label_offset]  # truncate
+
     print(input_signal.size)
     inputs = torch.Tensor(input_signal)
     labels = torch.Tensor(label_signal)
-    # inputs = inputs.to(DEVICE)
-    # labels = labels.to(DEVICE)
-    # dataset = TensorDataset(inputs, labels)
+
     dataset = AudioDataset([inputs, labels], SPLIT_LENGTH if is_training else VAL_SPLIT_LENGTH, is_training=is_training)
-    loader = DataLoader(dataset, batch_size=batchsize, shuffle=is_training)
-    return loader
-
-
-def get_dataloader_prefiltered(input_paths, label_path, batchsize=1, is_training=False):
-    raise NotImplementedError('need to update data loader for prefiltered signals')
-    label_signal, label_rate = utils.load_wav(label_path)
-    input_signals = []
-    for input_path in input_paths:
-        input_signal, signal_rate = utils.load_wav(input_path)
-        print((np.nanmax(input_signal), np.nanmin(input_signal), np.nanmean(input_signal), np.nanstd(input_signal)))
-        assert (signal_rate == label_rate)
-        assert np.all(np.isfinite(input_signal))
-        assert np.all(np.less(np.abs(input_signal), 100))
-        input_signals.append(input_signal)
-
-    # truncate label if it's somehow longer (reaper might've padded it)
-    label_signal = label_signal[:input_signals[0].size]
-
-    labels = utils.split_signal(label_signal)
-    input_signals = [utils.split_signal(signal) for signal in input_signals]
-    input_signals = np.concatenate(input_signals, axis=1)  # batches x freq_bands x split_length
-    print(input_signals.shape)
-
-    inputs = torch.Tensor(input_signals)
-    labels = torch.Tensor(labels)
-    inputs = inputs.to(DEVICE)
-    labels = labels.to(DEVICE)
-    dataset = TensorDataset(inputs, labels)
     loader = DataLoader(dataset, batch_size=batchsize, shuffle=is_training)
     return loader
 
 
 def train_model(exp_name='model', amp='jcm800', modeltype='blender', model_kwargs=None,
                 batchsize=1, n_epochs=1000, early_stopping=30, learnrate=1e-2, grad_clip=5.,
-                loss_type=None, loss_kwargs=None, prefiltered=False, apply_ir=True):
+                loss_type=None, loss_kwargs=None, apply_ir=True, label_offset=0):
+    """
+    :param exp_name: experiment name (used for save directory)
+    :param amp:
+    :param modeltype:
+    :param model_kwargs:
+    :param batchsize:
+    :param n_epochs:
+    :param early_stopping:
+    :param learnrate:
+    :param grad_clip:
+    :param loss_type:
+    :param loss_kwargs:
+    :param apply_ir: (bool) apply IR to validation output (use if IR is not applied in labels)
+    :param label_offset: (int) expected latency, in samples, to shift the labels by
+    :return:
+    """
     if amp not in exp_name:
         exp_name = amp + '_' + exp_name
 
@@ -75,22 +63,15 @@ def train_model(exp_name='model', amp='jcm800', modeltype='blender', model_kwarg
         assert ir_fs == FS
         print('IR shape: ' + str(ir.shape))
 
-    if prefiltered:
-        data_dir = os.path.join(BASE_DIR, 'data_%i' % FS)
-        train_signal = sorted(glob.glob(os.path.join(data_dir, 'prefilter', 'train_di*')))
-        train_label = os.path.join(data_dir, 'train_di_' + amp + '.wav')
-        val_signal = sorted(glob.glob(os.path.join(data_dir, 'prefilter', 'validation*')))
-        val_label = os.path.join(data_dir, 'validation_' + amp + '.wav')
-        train_loader = get_dataloader_prefiltered(train_signal, train_label, batchsize=batchsize, is_training=True)
-        val_loader = get_dataloader_prefiltered(val_signal, val_label, batchsize=batchsize, is_training=False)
-    else:
-        data_dir = os.path.join(BASE_DIR, 'data_%i' % FS)
-        train_signal = os.path.join(data_dir, 'train_di.wav')
-        train_label = os.path.join(data_dir, 'train_di_' + amp + '.wav')
-        val_signal = os.path.join(data_dir, 'validation.wav')
-        val_label = os.path.join(data_dir, 'validation_' + amp + '.wav')
-        train_loader = get_dataloader(train_signal, train_label, batchsize=batchsize, is_training=True)
-        val_loader = get_dataloader(val_signal, val_label, batchsize=batchsize, is_training=False)
+    data_dir = os.path.join(BASE_DIR, 'data_%i' % FS)
+    train_signal = os.path.join(data_dir, 'train_di.wav')
+    train_label = os.path.join(data_dir, 'train_di_' + amp + '.wav')
+    val_signal = os.path.join(data_dir, 'validation.wav')
+    val_label = os.path.join(data_dir, 'validation_' + amp + '.wav')
+    train_loader = get_dataloader(train_signal, train_label, batchsize=batchsize, is_training=True,
+                                  label_offset=label_offset)
+    val_loader = get_dataloader(val_signal, val_label, batchsize=batchsize, is_training=False,
+                                label_offset=label_offset)
 
     savedir = os.path.join(BASE_DIR, 'models_%i' % FS, exp_name)
     if not os.path.isdir(savedir):
@@ -210,7 +191,7 @@ def train_model(exp_name='model', amp='jcm800', modeltype='blender', model_kwarg
 
 
 def hyperparam_search(skip_existing=True):
-    results_json = os.path.join(BASE_DIR, 'results_fir44100_newloss.json')
+    results_json = os.path.join(BASE_DIR, 'results_fir44100_labeloffset.json')
     if os.path.isfile(results_json) and skip_existing:
         with open(results_json, 'r') as f:
             results = json.load(f)
@@ -219,11 +200,10 @@ def hyperparam_search(skip_existing=True):
     models = ['blender']
     depths = [7]  # [3, 5, 7, 9]
     widths = [40]  # [20, 30, 40]
-    droprates = [0]  # [0, 0.125/4, 0.125/2]
     fmins = [40]
     fmaxs = [16000]
     offsets = [1000.]
-    delays = [2, 4, 6, 8]
+    delays = [2, 4, 6, 8][::-1]
     amps = ['twin']  # ['twin', '5150', 'jcm800', 'ac30']  # ['5150', 'ac30', 'jcm800', 'plexi', 'recto', 'twin']
     windows = ['flattop', 'blackmanharris', 'bartlett', 'hann']
     n_ffts = [2048, 8192]  # [8192, 8192 * 2]
@@ -233,7 +213,7 @@ def hyperparam_search(skip_existing=True):
                   'l2_mel': [{'n_ffts': n_fft} for n_fft in n_ffts]}
     n_losses = sum([len(v) for v in loss_types.values()])
     n_experiments = len(models) * len(depths) * len(amps) * n_losses * len(widths) * len(fmins) * len(fmaxs) \
-                    * len(windows) * len(offsets) * len(droprates) * len(delays)
+                    * len(windows) * len(offsets) * len(delays)
     n_done = 0
     start_time = time.time()
     for modeltype in models:
@@ -247,12 +227,7 @@ def hyperparam_search(skip_existing=True):
                                     for offset in offsets:
                                         for loss_type, loss_kwargs in loss_types.items():
                                             for loss_kwarg in loss_kwargs:
-                                                # exp_name = '%s_%s_learnfilt_newloader_d%i_w%i_drop%s_%s_fmin%i_fmax%ik_offset%i_%s_%s' % (
-                                                #     amp, modeltype, depth, width, str(droprate), window,
-                                                #     fmin, fmax // 1000, offset,
-                                                #     re.sub(r"[_]", '', loss_type),
-                                                #     re.sub(r"[ :'{,_}]", '', str(loss_kwarg)))
-                                                exp_name = '%s_%s_d%i_w%i_delay%i_%s_fmin%i_fmax%ik_offset%i_%s_%s_lossexplore' % (
+                                                exp_name = '%s_%s_d%i_w%i_delay%i_%s_fmin%i_fmax%ik_offset%i_%s_%s_labeloffset' % (
                                                     amp, modeltype, depth, width, delay, window,
                                                     fmin, fmax // 1000, offset,
                                                     re.sub(r"[_]", '', loss_type),
@@ -272,7 +247,8 @@ def hyperparam_search(skip_existing=True):
                                                     val_loss = train_model(
                                                         amp=amp, exp_name=exp_name, modeltype=modeltype,
                                                         model_kwargs=model_kwargs, loss_type=loss_type,
-                                                        loss_kwargs=loss_kwarg, learnrate=lr)
+                                                        loss_kwargs=loss_kwarg, learnrate=lr,
+                                                        label_offset=int(delay/1000*FS))
                                                     if np.isfinite(val_loss):
                                                         break
                                                     else:
