@@ -42,12 +42,12 @@ def vis_filters():
     import matplotlib
     matplotlib.use("Agg")
 
-    from scipy import signal
     import matplotlib.pyplot as plt
     fig, axs = plt.subplots(4)
     fs = 44100
     filters = filterbank_fir(30, 80., 16000., fs, fs*2e-3/7)
 
+    from scipy import signal
     filter_sum = None
     filter_sum_truncated = None
     plot_min = 5

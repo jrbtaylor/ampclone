@@ -136,7 +136,7 @@ class FixedFilters(nn.Module):
 class Blender(nn.Module):
     def __init__(self, width=20, depth=7, activation='tanh',
                  f_min=40, f_max=16000, fs=44100, bias=True, window='triang', offset=250,
-                 learn_filters=False, dropout_rate=0, max_delay_ms=6):
+                 learn_filters=False, dropout_rate=0, max_delay_ms=2):
         """
         Similar to FixedFilters model but each layer has a learned "blend" parameter that blends its input and output
         """

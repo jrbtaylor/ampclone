@@ -119,5 +119,6 @@ def split_signal(data):
 
 
 def clear_print(string='', end=''):
+    string = str(string)
     clear = '\x1b[2K\r'
     print(clear + string, end=end)
