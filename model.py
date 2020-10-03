@@ -5,11 +5,26 @@ import torch.nn as nn
 from filterbank import filterbank_fir
 
 
+class Saturate(nn.Module):
+    """ Softsign with learned term in denominator """
+    def __init__(self, eps_init=-2., min_eps=0.1, max_eps=10.):
+        super(Saturate, self).__init__()
+        self.eps = nn.Parameter(torch.from_numpy(np.array(eps_init)).type(torch.get_default_dtype()),
+                                requires_grad=True)
+        self.min_eps = min_eps
+        self.max_eps = max_eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        eps = self.min_eps + (self.max_eps - self.min_eps) * nn.functional.sigmoid(self.eps)
+        return x / (eps + torch.abs(x))
+
+
 ACTIVATIONS = {'sigmoid': nn.Sigmoid(),
                'tanh': nn.Tanh(),
                'softsign': nn.Softsign(),
                'relu': nn.ReLU(),
-               'linear': nn.Identity()}
+               'linear': nn.Identity(),
+               'saturate': Saturate()}
 
 
 def get_model(model_type, model_kwargs):
@@ -18,7 +33,8 @@ def get_model(model_type, model_kwargs):
               'fixedfilter': FixedFilters,
               'crossover': Crossover,
               'blender': Blender,
-              'blenderv2': BlenderV2}
+              'blenderv2': BlenderV2,
+              'multiphase': Multiphase}
     return models[model_type](**model_kwargs)
 
 
@@ -85,11 +101,10 @@ class WaveNet(nn.Module):
 
 
 class FIRFilter(nn.Module):
-    def __init__(self, n_filters, f_min, f_max, fs, max_delay, window='triang', offset=250, learn_filters=False):
+    def __init__(self, n_filters, f_min, f_max, fs, max_delay, window='flattop', offset=250, learn_filters=False):
         super(FIRFilter, self).__init__()
         filters = np.array(filterbank_fir(n_filters, f_min, f_max, fs, max_delay, window=window, offset=offset,
                                           min_phase=False))
-        # print('INFO: filter_length arg is currently ignored for filterbank_fir call')
         # expand dims so filters is shaped (n_filters, in_channels=1, filter_length)
         filters = np.expand_dims(filters, axis=1)
         self.filters = torch.nn.Parameter(torch.from_numpy(filters).type(torch.get_default_dtype()),
@@ -106,8 +121,48 @@ class FIRFilter(nn.Module):
         return torch.nn.functional.conv1d(x, filters)
 
 
+class MultiFIR(nn.Module):
+    def __init__(self, n_filters, f_min, f_max, fs, max_delays, window='flattop', offset=250):
+        super(MultiFIR, self).__init__()
+        filters = [np.array(
+            filterbank_fir(n_filters, f_min, f_max, fs, max_delay, window=window, offset=offset, min_phase=False))
+            for max_delay in max_delays]
+        max_len = np.max([f.shape[-1] for f in filters])
+        filters = [np.concatenate([f, np.zeros([n_filters, max_len-f.shape[-1]])], axis=-1) for f in filters]
+        filters = np.concatenate(filters, axis=0)
+        # expand dims so filters is shaped (n_filters, in_channels=1, filter_length)
+        filters = np.expand_dims(filters, axis=1)
+        self.filters = torch.nn.Parameter(torch.from_numpy(filters).type(torch.get_default_dtype()),
+                                          requires_grad=False)
+        self.pad = nn.ConstantPad1d((filters.shape[-1] - 1, 0), 0.)
+
+    def forward(self, x):
+        x = self.pad(x)
+        return torch.nn.functional.conv1d(x, self.filters)
+
+
+class MultiFIR2(nn.Module):
+    def __init__(self, nminmaxdelays, fs, window='flattop', offset=250):
+        super(MultiFIR2, self).__init__()
+        filters = [np.array(
+            filterbank_fir(n, f_min, f_max, fs, max_delay, window=window, offset=offset, min_phase=False))
+            for n, f_min, f_max, max_delay in nminmaxdelays]
+        max_len = np.max([f.shape[-1] for f in filters])
+        filters = [np.concatenate([f, np.zeros([f.shape[0], max_len-f.shape[-1]])], axis=-1) for f in filters]
+        filters = np.concatenate(filters, axis=0)
+        # expand dims so filters is shaped (n_filters, in_channels=1, filter_length)
+        filters = np.expand_dims(filters, axis=1)
+        self.filters = torch.nn.Parameter(torch.from_numpy(filters).type(torch.get_default_dtype()),
+                                          requires_grad=False)
+        self.pad = nn.ConstantPad1d((filters.shape[-1] - 1, 0), 0.)
+
+    def forward(self, x):
+        x = self.pad(x)
+        return torch.nn.functional.conv1d(x, self.filters)
+
+
 class FixedFilters(nn.Module):
-    def __init__(self, width=20, depth=7, activation='tanh', f_min=40, f_max=16000, fs=44100, bias=True):
+    def __init__(self, width=20, depth=7, activation='softsign', f_min=40, f_max=16000, fs=44100, bias=True):
         super(FixedFilters, self).__init__()
         max_delay = 0.002 * fs * 0.9 / depth  # 2 millisecond delay * sample freq * 0.9 crap factor, per layer
         self.filters = FIRFilter(width, f_min, f_max, fs, max_delay)
@@ -134,8 +189,8 @@ class FixedFilters(nn.Module):
 
 
 class Blender(nn.Module):
-    def __init__(self, width=20, depth=7, activation='tanh',
-                 f_min=40, f_max=16000, fs=44100, bias=True, window='triang', offset=250,
+    def __init__(self, width=20, depth=7, activation='softsign',
+                 f_min=40, f_max=16000, fs=44100, bias=True, window='flattop', offset=250,
                  learn_filters=False, dropout_rate=0, max_delay_ms=2):
         """
         Similar to FixedFilters model but each layer has a learned "blend" parameter that blends its input and output
@@ -183,9 +238,76 @@ class Blender(nn.Module):
         return x
 
 
+class Multiphase(nn.Module):
+    def __init__(self, width=40, depth=7, activation='softsign',
+                 f_min=40, f_max=16000, fs=44100, bias=True, window='flattop', offset=1000,
+                 max_delays=[0.5, 1., 2., 4.]):
+        """
+        Similar to FixedFilters model but each layer has a learned "blend" parameter that blends its input and output
+        v1: max_delays=[0.5, 1., 2., 4.]
+        v2: max_delays=[1., 2., 4., 8.]
+        v3: max_delays=[0.5, 1., 1.5, 2.]
+        v4: max_delays=[0.7, 1.4, 2.1, 2.8]
+        v5: max_delays=[0.5, 1., 1.5, 2., 4.]
+        v6: max_delays=[1., 2., 4.]
+        v7: max_delays=[1., 1.5, 2., 2.5]
+        """
+        super(Multiphase, self).__init__()
+
+        max_delays = [max_delay_ms/1000*fs/depth for max_delay_ms in max_delays]  # per layer, in samples
+        total_width = width*len(max_delays)
+        self.filters = MultiFIR(width, f_min, f_max, fs, max_delays, window=window, offset=offset)
+
+        # nminmaxdelays = [(20, 2000, 20000, 0.5/1000*fs/depth),
+        #                  (15, 1000, 16000, 1./1000*fs/depth),
+        #                  (15, 500, 12000, 2./1000*fs/depth),
+        #                  (15, 200, 6000, 4./1000*fs/depth),
+        #                  (10, 40, 2000, 6./1000*fs/depth),
+        #                  (5, 40, 300, 8./1000*fs/depth)]
+        # self.filters = MultiFIR2(nminmaxdelays, fs, window=window, offset=offset)
+        # nminmaxdelays = [(15, 2000, 20000, 0.5/1000*fs/depth),
+        #                  (15, 1000, 20000, 1./1000*fs/depth),
+        #                  (15, 500, 16000, 2./1000*fs/depth),
+        #                  (15, 200, 12000, 4./1000*fs/depth),
+        #                  (15, 40, 6000, 6./1000*fs/depth),
+        #                  (5, 40, 300, 10./1000*fs/depth)]
+        # self.filters = MultiFIR2(nminmaxdelays, fs, window=window, offset=offset)
+        # total_width = 80
+
+        self.recombines = nn.ModuleList()
+        self.activation = ACTIVATIONS[activation]
+        self.depth = depth
+        self.blends = torch.nn.ParameterList()
+        self.blend_sigmoid = torch.nn.Sigmoid()
+        blend_init = 1.
+
+        for d in range(depth):
+            conv_layer = torch.nn.Conv1d(total_width, 1, kernel_size=1, stride=1, bias=bias)
+            conv_layer.weight.data.fill_(1./len(max_delays))
+            if bias:
+                conv_layer.bias.data.fill_(0.)
+            self.recombines.append(conv_layer)
+            self.blends.append(
+                torch.nn.Parameter(torch.from_numpy(np.array(blend_init)).type(torch.get_default_dtype()),
+                                   requires_grad=True))
+        # output gain
+        self.output_gain = nn.Parameter(torch.from_numpy(np.array(3.)).type(torch.get_default_dtype()),
+                                        requires_grad=True)
+
+    def forward(self, x):
+        for idx in range(self.depth):
+            y = self.filters(x)
+            y = self.recombines[idx](y)
+            y = self.activation(y)
+            blend = self.blend_sigmoid(self.blends[idx])
+            x = (1-blend)*x+blend*y
+        x = self.output_gain*x
+        return x
+
+
 class BlenderV2(nn.Module):
-    def __init__(self, width=20, depth=7, activation='tanh',
-                 f_min=40, f_max=16000, fs=44100, bias=True, window='triang', offset=250):
+    def __init__(self, width=20, depth=7, activation='softsign',
+                 f_min=40, f_max=16000, fs=44100, bias=True, window='flattop', offset=250):
         """
         Similar to FixedFilters model but each layer has a learned "blend" parameter that blends its input and output
         """
@@ -237,8 +359,8 @@ class Crossover(nn.Module):
     """
     Designed to allow easy modeling of crossover distortion from class A/B power section
     """
-    def __init__(self, width=20, depth=7, activation='tanh',
-                 f_min=40, f_max=10000, fs=44100, bias=True, window='triang', offset=250,
+    def __init__(self, width=20, depth=7, activation='softsign',
+                 f_min=40, f_max=10000, fs=44100, bias=True, window='flattop', offset=250,
                  learn_filters=False, dropout_rate=0):
         super(Crossover, self).__init__()
         max_delay = 0.002*fs*0.9/depth  # 2 millisecond delay * sample freq * 0.9 crap factor, per layer

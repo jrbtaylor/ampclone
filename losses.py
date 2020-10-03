@@ -86,7 +86,7 @@ def get_blend_loss2(n_ffts, time_weight):
     l2_mel_loss = get_l2_mel_loss(n_ffts)
     mse_loss = get_mse_time_loss()
     # additional longer spectral loss to better capture global EQ, especially low-end?
-    long_loss = get_l2_mel_loss(131072)  # 2**32, not sure it needs to be power of 2
+    long_loss = get_l2_mel_loss(131072)  # 2**17, not sure it needs to be power of 2
 
     def _blend(pred, label):
         return 0.7 * l2_mel_loss(pred, label) + 0.3 * long_loss(pred, label) + time_weight * mse_loss(pred, label)
@@ -94,7 +94,48 @@ def get_blend_loss2(n_ffts, time_weight):
     return _blend
 
 
-def get_eq_loss(n_ffts, time_weight, bands=5, reduce='max'):
+def get_blend_loss3(n_ffts, time_weight):
+    l2_mel_losses = [get_l2_mel_loss(n_ffts * (2 ** idx)) for idx in range(4)]
+    mse_loss = get_mse_time_loss()
+
+    def _blend(pred, label):
+        return torch.mean(torch.stack(
+            [lss(pred, label) for lss in l2_mel_losses])) + time_weight * mse_loss(pred, label)
+
+    return _blend
+
+
+def get_blend_loss4(time_weight):
+    l2_mel_loss = get_l2_mel_loss(4096)
+    mse_loss = get_mse_time_loss()
+    # additional longer spectral loss to better capture global EQ, especially low-end?
+    long_loss = get_l2_mel_loss(131072)  # 2**17, not sure it needs to be power of 2
+
+    assert 0. < time_weight < 1.
+    mel_weight = 0.5 * (1. - time_weight)
+
+    def _blend(pred, label):
+        return mel_weight * l2_mel_loss(pred, label) + mel_weight * long_loss(pred, label) + time_weight * mse_loss(
+            pred, label)
+
+    return _blend
+
+
+def get_blend_loss5(time_weight):
+    mse_loss = get_mse_time_loss()
+    # additional longer spectral loss to better capture global EQ, especially low-end?
+    mel_loss = get_l2_mel_loss(131072)  # 2**17, not sure it needs to be power of 2
+
+    assert 0. < time_weight < 1.
+    mel_weight = 1. - time_weight
+
+    def _blend(pred, label):
+        return mel_weight * mel_loss(pred, label) + time_weight * mse_loss(pred, label)
+
+    return _blend
+
+
+def get_eq_loss(n_ffts, time_weight, bands=5, reduce='mean'):
     """
     Divides the melcepstrum into bands, selects the band with the highest L2 loss
     """
@@ -118,11 +159,9 @@ def get_eq_loss(n_ffts, time_weight, bands=5, reduce='max'):
         return eq_loss
 
     def _blend(pred, label):
-        return (0.2 * _loss(pred, label, n_ffts)
-                + 0.2 * _loss(pred, label, n_ffts // 2)
-                + 0.2 * _loss(pred, label, n_ffts * 2)
-                + 0.2 * _loss(pred, label, n_ffts // 4)
-                + 0.2 * _loss(pred, label, n_ffts * 4)
+        return (0.33 * _loss(pred, label, n_ffts)
+                + 0.33 * _loss(pred, label, n_ffts // 2)
+                + 0.33 * _loss(pred, label, n_ffts * 2)
                 + time_weight * mse_loss(pred, label))
 
     return _blend
@@ -141,7 +180,10 @@ class Loss(nn.Module):
                      'blend': get_blend_loss,
                      'blend2': get_blend_loss2,
                      'eqmax': get_eq_loss,
-                     'eqmean': get_eq_loss}
+                     'eqmean': get_eq_loss,
+                     'blend3': get_blend_loss3,
+                     'blend4': get_blend_loss4,
+                     'blend5': get_blend_loss5}
         if loss_type == 'eqmax':
             loss_kwargs['reduce'] = 'max'
         self.loss_fn = loss_dict[loss_type](**loss_kwargs)

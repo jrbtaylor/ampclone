@@ -33,7 +33,7 @@ def get_dataloader(input_path, label_path, batchsize=1, is_training=False):
 
 
 def train_model(exp_name='model', amp='jcm800', modeltype='blender', model_kwargs=None,
-                batchsize=1, n_epochs=1000, early_stopping=30, learnrate=1e-2, grad_clip=5.,
+                batchsize=1, n_epochs=1000, early_stopping=30, learnrate=1e-2, grad_clip=10.,
                 loss_type=None, loss_kwargs=None, apply_ir=True):
     """
     :param exp_name: experiment name (used for save directory)
@@ -194,43 +194,40 @@ def train_model(exp_name='model', amp='jcm800', modeltype='blender', model_kwarg
 
 
 def hyperparam_search(skip_existing=True):
-    results_json = os.path.join(BASE_DIR, 'results_fir44100_softsign.json')
-    if os.path.isfile(results_json) and skip_existing:
-        with open(results_json, 'r') as f:
-            results = json.load(f)
-    else:
-        results = {}
-    models = ['blender']
-    depths = [3, 5, 7]  # [3, 5, 7, 9]
-    widths = [20, 30, 40]  # [20, 30, 40]
+    models = ['blender']  # ['blender']
+    depths = [5, 6, 7]  # [3, 5, 7]
+    widths = [40, 50, 60, 70]
     fmins = [40]
     fmaxs = [16000]
-    offsets = [1000.]
-    amps = ['twin', '5150', 'plexi', 'jcm800', 'ac30', 'recto']
-    windows = ['flattop', 'blackmanharris', 'hann']
-    n_ffts = [4096]  # RULE OF THUMB: MINIMUM FREQ = 5 * FS / N_FFT
-    time_weights = [0.1]
-    # loss_types = {'blend': [{'n_ffts': n_fft, 'time_weight': time_weight}
-    #                         for n_fft in n_ffts for time_weight in time_weights],
-    #               'l2_mel': [{'n_ffts': n_fft} for n_fft in n_ffts]}
-    loss_types = {'blend': [{'n_ffts': n_fft, 'time_weight': time_weight}
-                            for n_fft in n_ffts for time_weight in time_weights]}
+    offsets = [0.]  # [1000.]
+    amps = ['5150', 'ac30', 'recto', 'plexi', 'jcm800', 'twin']  # ['twin', '5150', 'plexi', 'jcm800', 'ac30', 'recto']
+    windows = ['flattop']  # ['flattop', 'blackmanharris', 'hann']
+    time_weights = [0.8]
+    loss_types = {'blend4': [{'time_weight': time_weight}
+                             for time_weight in time_weights]}
     n_losses = sum([len(v) for v in loss_types.values()])
     n_experiments = len(models) * len(depths) * len(amps) * n_losses * len(widths) * len(fmins) * len(fmaxs) \
                     * len(windows) * len(offsets)
     n_done = 0
     start_time = time.time()
-    for modeltype in models:
-        for amp in amps:
-            for depth in depths[::-1]:
-                for width in widths[::-1]:
-                    for fmin in fmins:
-                        for fmax in fmaxs:
-                            for window in windows:
-                                for offset in offsets:
-                                    for loss_type, loss_kwargs in loss_types.items():
-                                        for loss_kwarg in loss_kwargs:
-                                            exp_name = '%s_%s_d%i_w%i_%s_fmin%i_fmax%ik_offset%i_%s_%s_softsign' % (
+    for loss_type, loss_kwargs in loss_types.items():
+        results_json = os.path.join(BASE_DIR, 'results_fir44100_final2_%s.json' % loss_type)
+        if os.path.isfile(results_json) and skip_existing:
+            with open(results_json, 'r') as f:
+                results = json.load(f)
+        else:
+            results = {}
+
+        for loss_kwarg in loss_kwargs:
+            for modeltype in models:
+                for amp in amps:
+                    for depth in depths[::-1]:
+                        for width in widths[::-1]:
+                            for fmin in fmins:
+                                for fmax in fmaxs:
+                                    for window in windows:
+                                        for offset in offsets:
+                                            exp_name = '%s_%s_final2_d%i_w%i_%s_fmin%i_fmax%ik_offset%i_%s_%s' % (
                                                 amp, modeltype, depth, width, window,
                                                 fmin, fmax // 1000, offset,
                                                 re.sub(r"[_]", '', loss_type),
@@ -242,8 +239,7 @@ def hyperparam_search(skip_existing=True):
                                             print(exp_name)
                                             model_kwargs = {'depth': depth, 'width': width, 'f_min': fmin,
                                                             'f_max': fmax, 'fs': FS, 'window': window,
-                                                            'offset': offset, 'learn_filters': False,
-                                                            'activation': 'softsign'}
+                                                            'offset': offset}  # , 'learn_filters': False}
                                             failed_experiments = 0
                                             lr = 1e-2  # was 1e-2 before using learned filters
                                             while failed_experiments < 5:
