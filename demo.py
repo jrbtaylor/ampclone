@@ -1,8 +1,10 @@
 import os
 from collections import OrderedDict
+from PIL import Image
 
 import imageio
-import moviepy
+import matplotlib
+from matplotlib import cm
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 import torch
@@ -11,12 +13,6 @@ from utils import load_wav, save_wav
 from model import get_model
 from config import FS, IR_FILE, DEVICE, VAL_SPLIT_LENGTH
 
-
-# TODO: update these (to ~95th percentile) after running the training set through a few models
-MIN_WEIGHT = 0.
-MAX_WEIGHT = 1.
-MIN_ACTIVATION = 0.
-MAX_ACTIVATION = 1.
 
 FINAL_WIDTH = 60  # TODO: update this later
 FINAL_DEPTH = 6
@@ -92,8 +88,23 @@ def run_demo(ckpt0, ckpt1, di_path, save_dir, alpha=0.5, apply_ir=True, width=60
     net.to(DEVICE)
     output, activations = inference(net, di_path, return_activations=True)
     if apply_ir:
+        # output = np.convolve(output, ir, mode='same')
+        length = output.size
         output = np.convolve(output, ir)
+        remove = output.size-length
+        # output = output[remove:]
+        output = output[:-remove]
     save_vis(weights, activations, output, save_dir, framerate=30)
+
+
+def colormap():
+    norm = matplotlib.colors.Normalize(vmin=0, vmax=255, clip=True)
+    mapper = cm.ScalarMappable(norm=norm, cmap='magma')
+    values = list(range(256))
+    cmap = []
+    for v in values:
+        cmap.append(mapper.to_rgba(v)[:3])
+    return np.array(cmap)
 
 
 def save_vis(weights, activations, model_output, save_dir, framerate=30):
@@ -114,39 +125,54 @@ def save_vis(weights, activations, model_output, save_dir, framerate=30):
     activations = np.abs(activations)
     assert FS % framerate == 0  # only integer downsampling is implemented here
     downsample_ratio = int(FS/framerate)
-    # activations = gaussian_filter1d(activations, sigma=3*downsample_ratio, axis=0, mode='constant')  # TODO: fix this, it's so slow it may never finish
-    # activations = activations[::downsample_ratio]
-    # TODO: try this version tomorrow, else debug above
     chunk_size = downsample_ratio
     if activations.shape[0] % chunk_size != 0:
         print(activations.shape)
-        zeros = np.zeros([activations.shape[0] % chunk_size, activations.shape[1], activations.shape[2]])
+        pad = int(np.ceil(activations.shape[0]/chunk_size)*chunk_size-activations.shape[0])
+        zeros = np.zeros([pad, activations.shape[1], activations.shape[2]])
         activations = np.concatenate([activations, zeros], axis=0)
+        print(activations.shape)
     activations = np.transpose(activations, axes=[1, 2, 0])  # time last: [n_layers, n_bands, n_samples]
     activations = np.reshape(activations, [activations.shape[0], activations.shape[1], -1, chunk_size])
     activations = np.mean(activations, axis=-1)
     activations = np.transpose(activations, axes=[2, 0, 1])  # time first: [n_samples, n_layers, n_bands]
     activations = gaussian_filter1d(activations, sigma=1, axis=0, mode='constant')  # smooth a bit more
 
-    # TODO: update this normalization
-    weights = (255*np.clip((weights-MIN_WEIGHT)/(MAX_WEIGHT-MIN_WEIGHT), 0., 1.)).astype('uint8')
-    activations = (255*np.clip((activations-MIN_ACTIVATION)/(MAX_ACTIVATION-MIN_ACTIVATION), 0., 1.)).astype('uint8')
+    # TODO: maybe need to align video and audio still? video is slightly longer due to padding
+    print(activations.shape, model_output.shape, weights.shape)
+
+    min_w = np.percentile(weights, 5, axis=-1, keepdims=True)
+    max_w = np.percentile(weights, 95, axis=-1, keepdims=True)
+    weights = (255*np.clip((weights-min_w)/(max_w-min_w), 0., 1.)).astype('uint8')
+    min_a = np.percentile(activations, 5, axis=0, keepdims=True)
+    max_a = np.percentile(activations, 95, axis=0, keepdims=True)
+    activations = (255*np.clip((activations-min_a)/(max_a-min_a), 0., 1.)).astype('uint8')
 
     weights = np.expand_dims(weights, axis=0)
-    imgs = np.zeros([activations.shape[0], activations.shape[1]+weights.shape[1], activations.shape[2]])
+    imgs = np.zeros([activations.shape[0], activations.shape[1]+weights.shape[1], activations.shape[2]], dtype='uint8')
     imgs[:, 0::2] = activations
     imgs[:, 1::2] = weights
+
+    norm = matplotlib.colors.Normalize(vmin=0, vmax=255, clip=True)
+    mapper = cm.ScalarMappable(norm=norm, cmap='afmhot')
+    shape = imgs.shape
+    imgs = mapper.to_rgba(imgs.reshape(-1))[..., :3].reshape(list(shape)+[3])
+    imgs = (255 * imgs).astype('uint8')
+    print(imgs.shape, shape)
 
     video_save = os.path.join(save_dir, 'output.mp4')
     writer = imageio.get_writer(video_save, fps=framerate)
     for idx in range(imgs.shape[0]):
-        writer.append_data(imgs[idx])
+        x = np.array(Image.fromarray(imgs[idx]).resize((16*imgs.shape[2], 64*imgs.shape[1]), Image.NEAREST))
+        writer.append_data(x)
     writer.close()
 
-    # videoclip = moviepy.video.io.VideoFileClip.VideoFileClip(video_save, audio=False)
-    # audioclip = moviepy.audio.io.AudioFileClip.AudioFileClip(audio_save, fps=FS)
-    # videoclip.set_audio(audioclip)
-    moviepy.video.io.ffmpeg_tools.ffmpeg_merge_video_audio(video=video_save, audio=audio_save, output=video_save)
+    # merge the audio file and video file, save to demo.mp4
+    final_output = os.path.join(save_dir, 'demo.mp4')
+    if os.path.isfile(final_output):
+        os.remove(final_output)  # avoids prompt to overwrite in ffmpeg command
+    os.system('ffmpeg -i %s -i %s -c:v copy -map 0:v:0 -map 1:a:0 -c:a aac -b:a 192k %s'
+              % (video_save, audio_save, final_output))
 
 
 
