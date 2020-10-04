@@ -189,9 +189,9 @@ class FixedFilters(nn.Module):
 
 
 class Blender(nn.Module):
-    def __init__(self, width=20, depth=7, activation='softsign',
-                 f_min=40, f_max=16000, fs=44100, bias=True, window='flattop', offset=250,
-                 learn_filters=False, dropout_rate=0, max_delay_ms=2):
+    def __init__(self, width=20, depth=6, activation='softsign',
+                 f_min=40, f_max=16000, fs=44100, bias=True, window='flattop', offset=0,
+                 learn_filters=False, dropout_rate=0, max_delay_ms=2, return_activations=False):
         """
         Similar to FixedFilters model but each layer has a learned "blend" parameter that blends its input and output
         """
@@ -206,6 +206,7 @@ class Blender(nn.Module):
         self.blend_sigmoid = torch.nn.Sigmoid()
         blend_init = 1.
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+        self.return_activations = return_activations
 
         if learn_filters:
             self.slow_parameters = self.filters.filters
@@ -223,9 +224,16 @@ class Blender(nn.Module):
         self.output_gain = nn.Parameter(torch.from_numpy(np.array(3.)).type(torch.get_default_dtype()),
                                         requires_grad=True)
 
+    def demo_mode(self):
+        self.return_activations = True
+
     def forward(self, x):
+        activations = []
         for idx in range(self.depth):
             y = self.filters(x)
+
+            if self.return_activations:
+                activations.append(y)
 
             if self.dropout is not None:
                 y = self.dropout(y)
@@ -235,6 +243,9 @@ class Blender(nn.Module):
             blend = self.blend_sigmoid(self.blends[idx])
             x = (1-blend)*x+blend*y
         x = self.output_gain*x
+
+        if self.return_activations:
+            return x, activations
         return x
 
 
