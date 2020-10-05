@@ -199,7 +199,10 @@ class Blender(nn.Module):
         max_delay = max_delay_ms/1000*fs/depth  # per layer, in samples
         self.filters = FIRFilter(width, f_min, f_max, fs, max_delay, window=window, offset=offset,
                                  learn_filters=learn_filters)
-        self.recombines = nn.ModuleList()
+        # self.recombines = nn.ModuleList()
+        self.recombines = torch.nn.ParameterList()
+        self.biases = torch.nn.ParameterList()
+
         self.activation = ACTIVATIONS[activation]
         self.depth = depth
         self.blends = torch.nn.ParameterList()
@@ -212,11 +215,18 @@ class Blender(nn.Module):
             self.slow_parameters = self.filters.filters
 
         for d in range(depth):
-            conv_layer = torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias)
-            conv_layer.weight.data.fill_(1.)
-            if bias:
-                conv_layer.bias.data.fill_(0.)
-            self.recombines.append(conv_layer)
+            # conv_layer = torch.nn.Conv1d(width, 1, kernel_size=1, stride=1, bias=bias)
+            # conv_layer.weight.data.fill_(1.)
+            # if bias:
+            #     conv_layer.bias.data.fill_(0.)
+            # self.recombines.append(conv_layer)
+            self.recombines.append(
+                torch.nn.Parameter(torch.from_numpy(np.ones([1, width, 1])).type(torch.get_default_dtype()),
+                                   requires_grad=True))
+            self.biases.append(
+                torch.nn.Parameter(torch.from_numpy(np.array([0.])).type(torch.get_default_dtype()),
+                                   requires_grad=True))
+
             self.blends.append(
                 torch.nn.Parameter(torch.from_numpy(np.array(blend_init)).type(torch.get_default_dtype()),
                                    requires_grad=True))
@@ -238,7 +248,8 @@ class Blender(nn.Module):
             if self.dropout is not None:
                 y = self.dropout(y)
 
-            y = self.recombines[idx](y)
+            # y = self.recombines[idx](y)
+            y = torch.nn.functional.conv1d(y, torch.square(self.recombines[idx]), self.biases[idx])
             y = self.activation(y)
             blend = self.blend_sigmoid(self.blends[idx])
             x = (1-blend)*x+blend*y

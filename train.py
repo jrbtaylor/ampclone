@@ -197,7 +197,7 @@ def hyperparam_search(skip_existing=True):
     n_trials = 3
     models = ['blender']  # ['blender']
     depths = [6]  # [3, 5, 7]
-    widths = [20, 40, 60]
+    widths = [60]
     fmin = 40
     fmax = 16000
     offset = 0
@@ -211,7 +211,7 @@ def hyperparam_search(skip_existing=True):
     n_done = 0
     start_time = time.time()
     for loss_type, loss_kwargs in loss_types.items():
-        results_json = os.path.join(BASE_DIR, 'results_fir44100_final2_%s.json' % loss_type)
+        results_json = os.path.join(BASE_DIR, 'results_fir44100_final3_%s.json' % loss_type)  # FINAL 3 IS WITH SQUARED WEIGHTS
         if os.path.isfile(results_json) and skip_existing:
             with open(results_json, 'r') as f:
                 results = json.load(f)
@@ -224,7 +224,7 @@ def hyperparam_search(skip_existing=True):
                     for depth in depths[::-1]:
                         for width in widths[::-1]:
                             for trial in range(n_trials):
-                                exp_name = '%s_%s_final2_d%i_w%i_%s_fmin%i_fmax%ik_offset%i_%s_%s_trial%i' % (
+                                exp_name = '%s_%s_final3_d%i_w%i_%s_fmin%i_fmax%ik_offset%i_%s_%s_trial%i' % (
                                     amp, modeltype, depth, width, window,
                                     fmin, fmax // 1000, offset,
                                     re.sub(r"[_]", '', loss_type),

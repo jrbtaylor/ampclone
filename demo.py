@@ -17,8 +17,8 @@ FINAL_WIDTH = 60  # TODO: update this later
 FINAL_DEPTH = 6
 
 DI_DIR = '/home/jtaylor/cloner/data_44100'
-MODEL_DIR = '/home/jtaylor/cloner/final_models/'
-OUTPUT_DIR = '/home/jtaylor/cloner/demo/'
+MODEL_DIR = '/home/jtaylor/cloner/final3_models/'
+OUTPUT_DIR = '/home/jtaylor/cloner/demo_squareweights/'
 
 
 def load_ckpt(ckpt_path, model_type='blender', width=FINAL_WIDTH, model_kwargs=None):
@@ -40,7 +40,38 @@ def combine_ckpts(ckpt0, ckpt1, alpha, model_type='blender', width=FINAL_WIDTH, 
     """
     param0 = torch.load(ckpt0)
     param1 = torch.load(ckpt1)
-    state_dict = OrderedDict([(key, (1 - alpha) * param0[key] + alpha * param1[key]) for key in param0.keys()])
+    # TODO: fix this. v2, v3, and v4 all sound the same, v1 sucks. look up vector operations, rotating from one to another? maybe add a third amp?
+    # v1: average parameters
+    # state_dict = OrderedDict([(key, (1 - alpha) * param0[key] + alpha * param1[key]) for key in param0.keys()])
+    # v2: average abs-value of parameters, keep sign from ckpt1
+    # state_dict = OrderedDict([(key, (1-alpha)*torch.sign(param1[key])*torch.abs(param0[key]) + alpha * param1[key])
+    #                           for key in param1.keys()])
+    # v3: average abs-value of parameters, keep sign from ckpt1, normalize by L1
+    # state_dict = OrderedDict(
+    #     [(key, (1 - alpha) * torch.sign(param1[key]) * torch.abs(param0[key]) + alpha * param1[key])
+    #      for key in param1.keys()])
+    # state_dict = OrderedDict(
+    #     [(key, state_dict[key]*torch.mean(
+    #         torch.abs(param0[key])+torch.abs(param1[key]))/2/torch.mean(torch.abs(state_dict[key])))
+    #      for key in state_dict.keys()])
+    # v4: average abs-value of parameters, keep sign from ckpt1, normalize by L2
+    # state_dict = OrderedDict(
+    #     [(key, (1 - alpha) * torch.sign(param1[key]) * torch.abs(param0[key]) + alpha * param1[key])
+    #      for key in param1.keys()])
+    # def l2(x):
+    #     return torch.sqrt(torch.mean(torch.square(x)))
+    # state_dict = OrderedDict(
+    #     [(key, state_dict[key]*((1 - alpha)*l2(param0[key])+alpha*l2(param1[key]))/l2(state_dict[key]))
+    #      for key in state_dict.keys()])
+
+    # for squared weights, need to square, average, then take square root. for all other nonsquared params, just average
+    def square_avg(key):
+        return torch.sqrt((1-alpha)*torch.square(param0[key])+alpha*torch.square(param1[key]))
+    def avg(key):
+        return (1-alpha)*param0[key]+alpha*param1[key]
+    state_dict = OrderedDict(
+        [(key, square_avg(key) if 'recombines' in key else avg(key))
+         for key in param0.keys()])
 
     if model_kwargs is None:
         model_kwargs = dict([])
@@ -51,8 +82,10 @@ def combine_ckpts(ckpt0, ckpt1, alpha, model_type='blender', width=FINAL_WIDTH, 
     if not return_weights:
         return net
     else:
+        # weights = np.concatenate(
+        #     [state_dict['recombines.%i.weight' % idx].data.cpu().numpy() for idx in range(depth)], axis=0)
         weights = np.concatenate(
-            [state_dict['recombines.%i.weight' % idx].data.cpu().numpy() for idx in range(depth)], axis=0)
+            [state_dict['recombines.%i' % idx].data.cpu().numpy() for idx in range(depth)], axis=0)
         weights = np.squeeze(weights, axis=-1)
         return net, weights
 
@@ -90,6 +123,12 @@ def run_demo(ckpt0, ckpt1, di_path, save_to, alpha=0.5, apply_ir=True, width=FIN
         output = np.convolve(output, ir)
         remove = output.size - length
         output = output[:-remove]
+    # normalize
+    output = np.nan_to_num(output, copy=False, nan=0., posinf=np.nanmax(output), neginf=np.nanmin(output))
+    output = 0.2*output/np.nanstd(output)
+    if np.nanmax(np.abs(output)) > 1.:
+        output = output/np.nanmax(np.abs(output))
+    print('WAV MAX: '+str(np.max(np.abs(output))))
     save_vis(weights, activations, output, save_to, framerate=30)
 
 
@@ -123,19 +162,14 @@ def save_vis(weights, activations, model_output, save_to, framerate=30):
     downsample_ratio = int(FS / framerate)
     chunk_size = downsample_ratio
     if activations.shape[0] % chunk_size != 0:
-        print(activations.shape)
         pad = int(np.ceil(activations.shape[0] / chunk_size) * chunk_size - activations.shape[0])
         zeros = np.zeros([pad, activations.shape[1], activations.shape[2]])
         activations = np.concatenate([activations, zeros], axis=0)
-        print(activations.shape)
     activations = np.transpose(activations, axes=[1, 2, 0])  # time last: [n_layers, n_bands, n_samples]
     activations = np.reshape(activations, [activations.shape[0], activations.shape[1], -1, chunk_size])
     activations = np.mean(activations, axis=-1)
     activations = np.transpose(activations, axes=[2, 0, 1])  # time first: [n_samples, n_layers, n_bands]
     activations = gaussian_filter1d(activations, sigma=1, axis=0, mode='constant')  # smooth a bit more
-
-    # TODO: maybe need to align video and audio still? video is slightly longer due to padding
-    print(activations.shape, model_output.shape, weights.shape)
 
     min_w = np.percentile(weights, 5, axis=-1, keepdims=True)
     max_w = np.percentile(weights, 95, axis=-1, keepdims=True)
@@ -155,7 +189,6 @@ def save_vis(weights, activations, model_output, save_to, framerate=30):
     shape = imgs.shape
     imgs = mapper.to_rgba(imgs.reshape(-1))[..., :3].reshape(list(shape) + [3])
     imgs = (255 * imgs).astype('uint8')
-    print(imgs.shape, shape)
 
     video_save = os.path.join(OUTPUT_DIR, save_to + '_videoonly.mp4')
     writer = imageio.get_writer(video_save, fps=framerate)
