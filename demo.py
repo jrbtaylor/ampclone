@@ -1,9 +1,10 @@
 import os
 from collections import OrderedDict
-from PIL import Image
+from PIL import Image, ImageFont, ImageDraw
 
 import imageio
-import matplotlib
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from matplotlib import cm
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
@@ -19,6 +20,18 @@ FINAL_DEPTH = 6
 DI_DIR = '/home/jtaylor/cloner/data_44100'
 MODEL_DIR = '/home/jtaylor/cloner/final3_models/'
 OUTPUT_DIR = '/home/jtaylor/cloner/demo_squareweights/'
+PLOT_DIR = '/home/jtaylor/cloner/plots/'
+DISPLAY = {'5150': '5150',
+           'ac30': 'AC30',
+           'jcm800': 'JCM800',
+           'plexi': 'SuperLead',
+           'recto': 'TripleRectifier',
+           'twin': 'Twin'}
+
+
+def _get_ckpt(amp):
+    folder = os.path.join(MODEL_DIR, amp)
+    return next(os.path.join(folder, f) for f in os.listdir(folder) if f.endswith('.pth'))
 
 
 def load_ckpt(ckpt_path, model_type='blender', width=FINAL_WIDTH, model_kwargs=None):
@@ -40,33 +53,10 @@ def combine_ckpts(ckpt0, ckpt1, alpha, model_type='blender', width=FINAL_WIDTH, 
     """
     param0 = torch.load(ckpt0)
     param1 = torch.load(ckpt1)
-    # TODO: fix this. v2, v3, and v4 all sound the same, v1 sucks. look up vector operations, rotating from one to another? maybe add a third amp?
-    # v1: average parameters
-    # state_dict = OrderedDict([(key, (1 - alpha) * param0[key] + alpha * param1[key]) for key in param0.keys()])
-    # v2: average abs-value of parameters, keep sign from ckpt1
-    # state_dict = OrderedDict([(key, (1-alpha)*torch.sign(param1[key])*torch.abs(param0[key]) + alpha * param1[key])
-    #                           for key in param1.keys()])
-    # v3: average abs-value of parameters, keep sign from ckpt1, normalize by L1
-    # state_dict = OrderedDict(
-    #     [(key, (1 - alpha) * torch.sign(param1[key]) * torch.abs(param0[key]) + alpha * param1[key])
-    #      for key in param1.keys()])
-    # state_dict = OrderedDict(
-    #     [(key, state_dict[key]*torch.mean(
-    #         torch.abs(param0[key])+torch.abs(param1[key]))/2/torch.mean(torch.abs(state_dict[key])))
-    #      for key in state_dict.keys()])
-    # v4: average abs-value of parameters, keep sign from ckpt1, normalize by L2
-    # state_dict = OrderedDict(
-    #     [(key, (1 - alpha) * torch.sign(param1[key]) * torch.abs(param0[key]) + alpha * param1[key])
-    #      for key in param1.keys()])
-    # def l2(x):
-    #     return torch.sqrt(torch.mean(torch.square(x)))
-    # state_dict = OrderedDict(
-    #     [(key, state_dict[key]*((1 - alpha)*l2(param0[key])+alpha*l2(param1[key]))/l2(state_dict[key]))
-    #      for key in state_dict.keys()])
-
     # for squared weights, need to square, average, then take square root. for all other nonsquared params, just average
-    def square_avg(key):
-        return torch.sqrt((1-alpha)*torch.square(param0[key])+alpha*torch.square(param1[key]))
+    def square_avg(key):  # note: clamp avoids NaNs
+        return torch.sqrt(torch.clamp((1-alpha)*torch.square(param0[key])+alpha*torch.square(param1[key]),
+                                      0., 100.))
     def avg(key):
         return (1-alpha)*param0[key]+alpha*param1[key]
     state_dict = OrderedDict(
@@ -124,8 +114,7 @@ def run_demo(ckpt0, ckpt1, di_path, save_to, alpha=0.5, apply_ir=True, width=FIN
         remove = output.size - length
         output = output[:-remove]
     # normalize
-    output = np.nan_to_num(output, copy=False, nan=0., posinf=np.nanmax(output), neginf=np.nanmin(output))
-    output = 0.2*output/np.nanstd(output)
+    output = 0.17*output/np.nanstd(output)
     if np.nanmax(np.abs(output)) > 1.:
         output = output/np.nanmax(np.abs(output))
     print('WAV MAX: '+str(np.max(np.abs(output))))
@@ -171,6 +160,8 @@ def save_vis(weights, activations, model_output, save_to, framerate=30):
     activations = np.transpose(activations, axes=[2, 0, 1])  # time first: [n_samples, n_layers, n_bands]
     activations = gaussian_filter1d(activations, sigma=1, axis=0, mode='constant')  # smooth a bit more
 
+    # weights = np.square(weights)
+    weights = np.power(np.abs(weights), 0.2)  # rescale non-linearly for clearer & more interesting visualization
     min_w = np.percentile(weights, 5, axis=-1, keepdims=True)
     max_w = np.percentile(weights, 95, axis=-1, keepdims=True)
     weights = (255 * np.clip((weights - min_w) / (max_w - min_w), 0., 1.)).astype('uint8')
@@ -191,10 +182,19 @@ def save_vis(weights, activations, model_output, save_to, framerate=30):
     imgs = (255 * imgs).astype('uint8')
 
     video_save = os.path.join(OUTPUT_DIR, save_to + '_videoonly.mp4')
+    fontsize = 76
+    font = ImageFont.truetype("/usr/share/fonts/dejavu/DejaVuSans.ttf", fontsize)
     writer = imageio.get_writer(video_save, fps=framerate)
+    display_text = save_to.replace('_', ' ')
+    display_text = ' '.join([DISPLAY.get(w, w) for w in display_text.split(' ')])
     for idx in range(imgs.shape[0]):
-        x = np.array(Image.fromarray(imgs[idx]).resize((16 * imgs.shape[2], 64 * imgs.shape[1]), Image.NEAREST))
-        writer.append_data(x)
+        x = imgs[idx]
+        x = np.concatenate([190*np.ones([1, x.shape[1], 3], dtype='uint8'), x], axis=0)
+        x = Image.fromarray(x).resize((40 * x.shape[1], 96 * x.shape[0]), Image.NEAREST)
+        draw = ImageDraw.Draw(x)
+        # draw.text((5, 10), display_text, (0, 255, 150), font=font)
+        draw.text((5, 5), display_text, (0, 0, 0), font=font)
+        writer.append_data(np.array(x))
     writer.close()
 
     # merge the audio file and video file, save to demo.mp4
@@ -206,11 +206,40 @@ def save_vis(weights, activations, model_output, save_to, framerate=30):
     os.remove(video_save)
 
 
-def full_demo():
-    def _get_ckpt(amp):
-        folder = os.path.join(MODEL_DIR, amp)
-        return next(os.path.join(folder, f) for f in os.listdir(folder) if f.endswith('.pth'))
+def vis_activations():
+    ckpt0 = _get_ckpt('jcm800')
+    di_path = os.path.join(DI_DIR, 'test.wav')
+    net, weights = combine_ckpts(ckpt0, ckpt0, alpha=0., model_type='blender', return_weights=True)
+    net.to(DEVICE)
+    input_signal, _ = load_wav(di_path)
+    output, activations = inference(net, di_path, return_activations=True)  # [n_samples, n_layers, n_bands]
 
+    offset = int(5e5)
+    length = int(3e3)
+    input_signal = np.squeeze(input_signal[offset:offset+length])                   # [n_samples]
+    activations = np.transpose(np.squeeze(activations[offset:offset+length, 1, :]))  # [n_bands, n_samples]
+    output = np.squeeze(output[offset:offset+length])                               # [n_samples]
+
+    def plot(y, name):
+        plt.figure(1)
+        plt.plot(y)
+        ax = plt.gca()
+        ax.axes.get_xaxis().set_visible(False)
+        ax.axes.get_yaxis().set_visible(False)
+        plt.gca().set_axis_off()
+        plt.subplots_adjust(top=1, bottom=0, right=1, left=0,
+                            hspace=0, wspace=0)
+        plt.margins(0, 0)
+        plt.savefig(os.path.join(PLOT_DIR, name+'.jpeg'), bbox_inches='tight', pad_inches=0)
+        plt.clf()
+
+    plot(input_signal, 'input')
+    plot(output, 'output')
+    for idx in range(activations.shape[0]):
+        plot(activations[idx], 'activation_%i.jpeg' % idx)
+
+
+def full_demo():
     di_path = os.path.join(DI_DIR, 'test.wav')
     amps = ['5150', 'ac30', 'jcm800', 'twin', 'recto', 'plexi']
 
@@ -221,7 +250,7 @@ def full_demo():
             if idx0 == idx1:
                 save_to = amps[idx0]
             else:
-                save_to = 'interpolate0.5_' + amps[idx0] + '_' + amps[idx1]
+                save_to = 'interpolate_0.5_from_' + amps[idx0] + '_to_' + amps[idx1]
             run_demo(_get_ckpt(amps[idx0]), _get_ckpt(amps[idx1]), di_path, save_to, alpha=0.5)
 
     # EXTRAPOLATION EXPERIMENTS
@@ -232,5 +261,5 @@ def full_demo():
                     continue
                 print('*' * 32 + '\n' + '    EXTRAPOLATION TEST %.2f: ' % extrap + amps[idx0] + ' + ' + amps[
                     idx1] + '\n' + '*' * 32)
-                save_to = 'extrapolate%.2f_' % extrap + amps[idx0] + '_' + amps[idx1]
+                save_to = 'extrapolate_%.2f_from_' % extrap + amps[idx0] + '_to_' + amps[idx1]
                 run_demo(_get_ckpt(amps[idx0]), _get_ckpt(amps[idx1]), di_path, save_to, alpha=extrap)
